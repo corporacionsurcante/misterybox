@@ -151,6 +151,21 @@ enum TicketStatus {
   REFUNDED
 }
 
+enum SubscriptionStatus {
+  PENDING   // creada, esperando que el usuario autorice el débito
+  ACTIVE
+  PAUSED
+  CANCELLED
+  EXPIRED
+}
+
+enum ChargeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  REFUNDED
+}
+
 // ─────────────────────────── USUARIOS Y BILLETERA ───────────────────────────
 
 model User {
@@ -198,6 +213,7 @@ model User {
   cartGambles    CartGamble[]
   ledgerEntries  PrizePoolLedger[]   @relation("LedgerUser")
   adminAuditLogs AdminAuditLog[]     @relation("AdminActor")
+  subscriptions  Subscription[]
 
   @@index([status, createdAt])
   @@index([fraudScore])
@@ -314,6 +330,7 @@ model Merchant {
   clicks       AffiliateClick[]
   transactions Transaction[]
   events       Event[]
+  plans        SubscriptionPlan[]
 
   @@index([isActive, category, sortOrder])
   @@index([network])
@@ -388,6 +405,7 @@ model Transaction {
   receipt       ReceiptValidation?
   payment       Payment?
   cartGamble    CartGamble?
+  charge        SubscriptionCharge?
 
   /// IDEMPOTENCIA: una red no puede crear dos veces la misma orden
   @@unique([source, externalOrderId])
@@ -526,6 +544,116 @@ model CartGamble {
 
   @@index([userId, createdAt])
   @@map("cart_gambles")
+}
+
+// ─────────────────────────── SUSCRIPCIONES ───────────────────────────
+// Modelo "merchant of record": el cliente le paga el precio completo a la
+// plataforma, que después le liquida `providerCost` al proveedor. El margen
+// bruto es (price - providerCost), y de ese margen sale el aporte al pool.
+// Modelarlo así es lo que impide otorgar cajas contra plata que en realidad
+// se le debe al proveedor.
+
+model SubscriptionPlan {
+  id          String  @id @default(uuid()) @db.Uuid
+  merchantId  String? @db.Uuid // el proveedor del servicio (ej. ClubAssistur)
+  slug        String  @unique
+  name        String
+  description String? @db.Text
+  imageUrl    String?
+
+  /// Lo que paga el suscriptor
+  price        Decimal @db.Decimal(14, 2)
+  /// Lo que le liquidás al proveedor por cada ciclo. price - providerCost = tu margen
+  providerCost Decimal @db.Decimal(14, 2)
+  currency     String  @default("ARS")
+
+  /// Cada cuánto se cobra: 1 + "months" = mensual
+  frequency     Int    @default(1)
+  frequencyType String @default("months")
+  /// Ciclos totales antes de terminar. null = hasta que el usuario cancele
+  repetitions   Int?
+  freeTrialDays Int?
+
+  /// Cajas que otorga CADA cobro (no sólo el primero)
+  boxesPerCycle Int     @default(1)
+  boxTier       BoxTier @default(SILVER)
+  /// Qué parte del margen va al pool de premios
+  poolShareRate Decimal @default(0.5000) @db.Decimal(5, 4)
+
+  /// Id del plan en Mercado Pago (preapproval_plan)
+  mpPreapprovalPlanId String? @unique
+
+  /// Lista de beneficios para mostrar en la página: ["Asistencia 24hs", ...]
+  benefits Json?
+
+  isActive   Boolean @default(true)
+  isFeatured Boolean @default(false)
+  sortOrder  Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  merchant      Merchant?      @relation(fields: [merchantId], references: [id])
+  subscriptions Subscription[]
+
+  @@index([isActive, sortOrder])
+  @@map("subscription_plans")
+}
+
+model Subscription {
+  id     String             @id @default(uuid()) @db.Uuid
+  userId String             @db.Uuid
+  planId String             @db.Uuid
+  status SubscriptionStatus @default(PENDING)
+
+  /// Id de la suscripción en Mercado Pago (preapproval)
+  mpPreapprovalId String? @unique
+  payerEmail      String?
+
+  startedAt    DateTime?
+  nextChargeAt DateTime?
+  cancelledAt  DateTime?
+  cancelReason String?
+
+  /// Cobros exitosos acumulados, para métricas de retención
+  cyclesCharged Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan    SubscriptionPlan     @relation(fields: [planId], references: [id])
+  charges SubscriptionCharge[]
+
+  @@index([userId, status])
+  @@index([status, nextChargeAt])
+  @@map("subscriptions")
+}
+
+/// Un cobro mensual. Es la unidad que otorga cajas: cada mes que el cliente
+/// paga, recibe sus cajas de nuevo — eso es lo que le da motivo para no darse
+/// de baja.
+model SubscriptionCharge {
+  id             String  @id @default(uuid()) @db.Uuid
+  subscriptionId String  @db.Uuid
+  transactionId  String? @unique @db.Uuid
+
+  /// Id del pago en Mercado Pago. Único: es la clave de idempotencia que evita
+  /// otorgar cajas dos veces si la notificación llega repetida.
+  mpPaymentId String       @unique
+  amount      Decimal      @db.Decimal(14, 2)
+  status      ChargeStatus @default(PENDING)
+
+  boxesGranted Int      @default(0)
+  chargedAt    DateTime @default(now())
+  rawPayload   Json?
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  transaction  Transaction? @relation(fields: [transactionId], references: [id])
+
+  @@index([subscriptionId, chargedAt])
+  @@index([status])
+  @@map("subscription_charges")
 }
 
 // ─────────────────────────── COMPROBANTES / OCR ───────────────────────────
