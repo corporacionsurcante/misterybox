@@ -1,5 +1,5 @@
 import { Queue } from 'bullmq';
-import { bullConnection } from './redis';
+import { getBullConnection } from './redis';
 
 export interface AffiliateWebhookJob {
   network: string;
@@ -18,11 +18,10 @@ export interface ReceiptJob {
  * Las colas se crean de forma perezosa a propósito.
  *
  * BullMQ abre la conexión a Redis apenas se instancia una Queue. Si eso pasa
- * al importar el módulo, Next intenta conectarse a Redis durante `next build`
- * (cuando recolecta los datos de las páginas) y el build se llena de
- * ECONNREFUSED — o directamente falla si el proveedor no tiene Redis al alcance
- * en esa etapa. Creándolas dentro de una función, la conexión recién se abre
- * cuando un request de verdad la necesita.
+ * al importar el módulo, Next intenta conectarse durante `next build` (cuando
+ * recolecta los datos de las páginas) y el build falla por una variable de
+ * entorno. Creándolas dentro de una función, la conexión se abre recién cuando
+ * un request de verdad la necesita.
  */
 const globalForQueues = globalThis as unknown as {
   webhookQueue?: Queue<AffiliateWebhookJob>;
@@ -32,7 +31,7 @@ const globalForQueues = globalThis as unknown as {
 export function getWebhookQueue(): Queue<AffiliateWebhookJob> {
   if (!globalForQueues.webhookQueue) {
     globalForQueues.webhookQueue = new Queue<AffiliateWebhookJob>('webhooks', {
-      connection: bullConnection,
+      connection: getBullConnection(),
     });
   }
   return globalForQueues.webhookQueue;
@@ -41,7 +40,7 @@ export function getWebhookQueue(): Queue<AffiliateWebhookJob> {
 export function getReceiptQueue(): Queue<ReceiptJob> {
   if (!globalForQueues.receiptQueue) {
     globalForQueues.receiptQueue = new Queue<ReceiptJob>('receipts', {
-      connection: bullConnection,
+      connection: getBullConnection(),
     });
   }
   return globalForQueues.receiptQueue;

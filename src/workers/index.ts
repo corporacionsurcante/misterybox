@@ -10,7 +10,7 @@
  */
 import 'dotenv/config';
 import { Worker, Job } from 'bullmq';
-import { bullConnection } from '@/lib/redis';
+import { getBullConnection } from '@/lib/redis';
 import { prisma } from '@/lib/prisma';
 import type { AffiliateWebhookJob } from '@/lib/queues';
 import {
@@ -171,7 +171,7 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
 
     return { attributed: true, transactionId: trx.id };
   },
-  { connection: bullConnection, concurrency: 5 },
+  { connection: getBullConnection(), concurrency: 5 },
 );
 
 webhookWorker.on('failed', (job, err) => {

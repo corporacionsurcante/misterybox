@@ -1,20 +1,23 @@
-import { redis } from './redis';
+import { getRedis } from './redis';
 
 /**
  * Rate limit por ventana fija con contador atómico en Redis.
  * Simple a propósito: en el MVP el objetivo es frenar bots y doble-clics,
  * no construir un sliding window perfecto.
  *
- * Si Redis está caído, la función deja pasar (fail-open). Para el endpoint de
- * apertura de cajas eso es aceptable porque la solvencia ya está protegida por
- * el lock transaccional del pool — el rate limit es defensa en profundidad,
- * no el control primario.
+ * Si Redis no está configurado o está caído, la función deja pasar (fail-open).
+ * Para el endpoint de apertura de cajas eso es aceptable porque la solvencia ya
+ * está protegida por el lock transaccional del pool — el rate limit es defensa
+ * en profundidad, no el control primario.
  */
 export async function rateLimit(
   key: string,
   limit: number,
   windowSeconds: number,
 ): Promise<{ ok: boolean; remaining: number; resetIn: number }> {
+  const redis = getRedis();
+  if (!redis) return { ok: true, remaining: limit, resetIn: windowSeconds };
+
   try {
     const redisKey = `rl:${key}`;
     const count = await redis.incr(redisKey);
