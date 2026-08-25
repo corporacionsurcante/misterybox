@@ -1,0 +1,834 @@
+// ============================================================================
+// MisteryBox — Schema Prisma completo (MVP)
+// PostgreSQL 15+ · Prisma 7 (la URL vive en prisma.config.ts)
+// ============================================================================
+// Principios de diseño:
+//  1. Toda actividad económica se normaliza en `Transaction`, sea cual sea el canal.
+//  2. El pool es un LIBRO DE DOBLE PARTIDA (PrizePoolLedger): filas inmutables,
+//     nunca un saldo suelto que se sobrescribe. El saldo se deriva sumando.
+//  3. Idempotencia por constraints únicos, no por lógica de aplicación.
+//  4. Dinero en NUMERIC/Decimal(14,2) — jamás Float.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────── ENUMS ───────────────────────────
+
+enum UserRole {
+  USER
+  STAFF // valida tickets QR en puerta
+  MODERATOR // revisa cola OCR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED // fraude detectado
+  BANNED
+}
+
+/// Cómo se integra el comercio con la plataforma
+enum IntegrationType {
+  AFFILIATE_LINK // link parametrizado con subID + postback S2S
+  AFFILIATE_API // reporte por API/CRON (ej. Mercado Libre)
+  NATIVE_CHECKOUT // vendemos nosotros (tickets de eventos)
+  SUBSCRIPTION // alta de servicio recurrente / CPA único
+  RECEIPT_OCR // validación por comprobante
+}
+
+enum MerchantCategory {
+  MARKETPLACE
+  DELIVERY
+  STREAMING
+  INSURANCE
+  TELECOM
+  NIGHTLIFE
+  RETAIL
+  TRAVEL
+  OTHER
+}
+
+enum TransactionType {
+  AFFILIATE_ORDER
+  SUBSCRIPTION
+  NATIVE_TICKET
+  CART_GAMBLE
+  RECEIPT_UPLOAD
+  ADJUSTMENT // corrección manual del admin
+}
+
+enum TransactionStatus {
+  PENDING // comisión reportada pero en ventana de devolución
+  APPROVED // comisión confirmada/cobrable
+  REJECTED // la red rechazó la conversión
+  REFUNDED // el usuario devolvió la compra
+  CANCELLED
+}
+
+enum BoxTier {
+  BRONZE
+  SILVER
+  GOLD
+  VIP
+}
+
+enum UserBoxStatus {
+  AVAILABLE // lista para abrir
+  OPENED
+  EXPIRED
+  REVOKED // la transacción origen se cayó antes de abrirla
+}
+
+enum PrizeType {
+  WALLET_CASH // saldo real en billetera (costo = valor)
+  STORE_DISCOUNT // cupón propio (costo ~0, valor percibido alto)
+  DIGITAL_ASSET // código/gift card de partner
+  PHYSICAL_PRODUCT // gadget, requiere logística
+  EVENT_PASS // entrada a evento propio (costo marginal bajo)
+  CASHBACK_REFUND // reembolso de la compra origen
+  JACKPOT // premio mayor progresivo
+}
+
+enum RewardStatus {
+  LOCKED // revelado, pero la tx origen sigue PENDING
+  UNLOCKED // disponible para canjear/retirar
+  CLAIMED // ya canjeado
+  EXPIRED
+  REVOKED // tx origen reembolsada
+}
+
+/// Tipos de asiento del libro del pool
+enum LedgerEntryType {
+  CONTRIBUTION // ingresó comisión aprobada → pool gastable
+  RESERVE // comisión PENDING → apartada, NO gastable
+  RESERVE_RELEASE // la reserva se confirmó y pasó a CONTRIBUTION
+  RESERVE_REVERSAL // la tx se reembolsó → se anula la reserva
+  PAYOUT // se pagó un premio con costo real
+  PAYOUT_REVERSAL // premio revocado → vuelve al pool
+  ADJUSTMENT // inyección/retiro manual del admin
+  JACKPOT_SEED // capital semilla para el jackpot
+}
+
+enum ReceiptStatus {
+  PROCESSING
+  APPROVED
+  REJECTED
+  MANUAL_REVIEW
+}
+
+enum WalletTxType {
+  PRIZE_CREDIT
+  WITHDRAWAL
+  PURCHASE // pagó una CART_GAMBLE o entrada con saldo
+  REFUND
+  ADJUSTMENT
+}
+
+enum PaymentProvider {
+  MERCADO_PAGO
+  STRIPE
+  WALLET
+}
+
+enum PaymentStatus {
+  INITIATED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum TicketStatus {
+  VALID
+  USED
+  CANCELLED
+  REFUNDED
+}
+
+// ─────────────────────────── USUARIOS Y BILLETERA ───────────────────────────
+
+model User {
+  id            String     @id @default(uuid()) @db.Uuid
+  email         String     @unique
+  emailVerified DateTime?
+  phone         String?    @unique // WhatsApp / magic link SMS
+  name          String?
+  avatarUrl     String?
+  role          UserRole   @default(USER)
+  status        UserStatus @default(ACTIVE)
+
+  // Gamificación
+  level          Int @default(1)
+  experience     Int @default(0)
+  totalPurchases Int @default(0)
+
+  /// Saldo disponible para retirar/gastar
+  balanceAvailable Decimal @default(0) @db.Decimal(14, 2)
+  /// Saldo ganado pero con la transacción origen aún PENDING (escrow)
+  balanceLocked    Decimal @default(0) @db.Decimal(14, 2)
+
+  // Antifraude
+  signupIp          String?
+  lastDeviceHash    String?
+  fraudScore        Int       @default(0)
+  suspendedReason   String?
+  dailyReceiptCount Int       @default(0)
+  dailyCountResetAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts       Account[]
+  sessions       Session[]
+  clicks         AffiliateClick[]
+  transactions   Transaction[]
+  userBoxes      UserBox[]
+  rewards        UserReward[]
+  receipts       ReceiptValidation[]
+  walletTxs      WalletTransaction[]
+  payments       Payment[]
+  tickets        EventTicket[]
+  boxOpenings    BoxOpening[]
+  cartGambles    CartGamble[]
+  ledgerEntries  PrizePoolLedger[]   @relation("LedgerUser")
+  adminAuditLogs AdminAuditLog[]     @relation("AdminActor")
+
+  @@index([status, createdAt])
+  @@index([fraudScore])
+  @@map("users")
+}
+
+/// OAuth (Google) — compatible con Auth.js
+model Account {
+  id                String  @id @default(uuid()) @db.Uuid
+  userId            String  @db.Uuid
+  provider          String
+  providerAccountId String
+  refreshToken      String? @db.Text
+  accessToken       String? @db.Text
+  expiresAt         Int?
+  tokenType         String?
+  scope             String?
+  idToken           String? @db.Text
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(uuid()) @db.Uuid
+  sessionToken String   @unique
+  userId       String   @db.Uuid
+  expires      DateTime
+  ip           String?
+  userAgent    String?  @db.Text
+  deviceHash   String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expires])
+  @@map("sessions")
+}
+
+model WalletTransaction {
+  id          String       @id @default(uuid()) @db.Uuid
+  userId      String       @db.Uuid
+  type        WalletTxType
+  amount      Decimal      @db.Decimal(14, 2) // positivo = crédito, negativo = débito
+  balanceAfter Decimal     @db.Decimal(14, 2)
+  description String?
+  rewardId    String?      @db.Uuid
+  paymentId   String?      @db.Uuid
+  createdAt   DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("wallet_transactions")
+}
+
+// ─────────────────────────── COMERCIOS Y SERVICIOS ───────────────────────────
+
+model Merchant {
+  id       String           @id @default(uuid()) @db.Uuid
+  slug     String           @unique // 'mercadolibre', 'rappi', 'clubassitur'
+  name     String
+  logoUrl  String?
+  category MerchantCategory
+  /// Red de afiliados que lo gestiona: 'awin', 'impact', 'admitad', 'direct'
+  network  String?
+
+  integrationType IntegrationType
+
+  /// Feature flag: apagar/prender el comercio sin deploy
+  isActive  Boolean @default(true)
+  isFeatured Boolean @default(false)
+  sortOrder Int     @default(0)
+
+  /// Comisión que nos paga el comercio (%) sobre el monto de la orden
+  commissionRate Decimal @db.Decimal(5, 4) // 0.0480 = 4.8%
+  /// Qué porcentaje de ESA comisión va al pool de premios (resto = margen)
+  poolShareRate  Decimal @default(0.5000) @db.Decimal(5, 4)
+
+  /// Plantilla de deep link. {{CLICK_ID}} y {{TARGET}} se reemplazan en runtime
+  affiliateUrlTemplate String? @db.Text
+  /// Secreto para validar la firma del postback de esta red
+  webhookSecret        String?
+
+  /// Reglas de otorgamiento de cajas (umbrales por tier), ver docs
+  boxRules Json? // { "BRONZE": {"minOrder": 0}, "SILVER": {"minOrder": 30}, ... }
+
+  minOrderAmount Decimal  @default(0) @db.Decimal(14, 2)
+  cookieWindowDays Int    @default(30)
+  approvalWindowDays Int  @default(14) // cuánto tarda en pasar a APPROVED
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clicks       AffiliateClick[]
+  transactions Transaction[]
+  events       Event[]
+
+  @@index([isActive, category, sortOrder])
+  @@index([network])
+  @@map("merchants")
+}
+
+// ─────────────────────────── TRACKING DE AFILIADOS ───────────────────────────
+
+model AffiliateClick {
+  id         String   @id @default(uuid()) @db.Uuid // ESTE es el subID/click_id
+  userId     String   @db.Uuid
+  merchantId String   @db.Uuid
+  targetUrl  String   @db.Text
+  ip         String?
+  userAgent  String?  @db.Text
+  deviceHash String?
+  expiresAt  DateTime // ahora + cookieWindowDays
+  createdAt  DateTime @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  merchant     Merchant      @relation(fields: [merchantId], references: [id])
+  transactions Transaction[]
+
+  @@index([userId, createdAt])
+  @@index([merchantId, createdAt])
+  @@index([expiresAt])
+  @@map("affiliate_clicks")
+}
+
+// ─────────────────────────── TRANSACCIONES (núcleo) ───────────────────────────
+
+model Transaction {
+  id     String            @id @default(uuid()) @db.Uuid
+  userId String            @db.Uuid
+  type   TransactionType
+  status TransactionStatus @default(PENDING)
+
+  merchantId String? @db.Uuid
+  clickId    String? @db.Uuid
+
+  /// Id de la orden en el sistema externo (red de afiliados, MP, Stripe)
+  externalOrderId String?
+  /// Red/proveedor que reportó: 'awin', 'mercadolibre', 'mercadopago', 'internal'
+  source          String
+
+  orderAmount     Decimal @db.Decimal(14, 2)
+  commissionGross Decimal @default(0) @db.Decimal(14, 2)
+  /// Parte de la comisión que alimenta el pool
+  poolContribution Decimal @default(0) @db.Decimal(14, 2)
+  /// Margen operativo de la plataforma
+  platformMargin  Decimal @default(0) @db.Decimal(14, 2)
+  currency        String  @default("ARS")
+
+  boxGranted    Boolean   @default(false)
+  approvedAt    DateTime?
+  rejectedAt    DateTime?
+  /// Fecha estimada de liberación del escrow
+  escrowReleaseAt DateTime?
+
+  rawPayload Json?
+  notes      String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  merchant Merchant?       @relation(fields: [merchantId], references: [id])
+  click    AffiliateClick? @relation(fields: [clickId], references: [id])
+
+  userBoxes     UserBox[]
+  ledgerEntries PrizePoolLedger[]
+  receipt       ReceiptValidation?
+  payment       Payment?
+  cartGamble    CartGamble?
+
+  /// IDEMPOTENCIA: una red no puede crear dos veces la misma orden
+  @@unique([source, externalOrderId])
+  @@index([userId, createdAt])
+  @@index([status, escrowReleaseAt])
+  @@index([merchantId, status])
+  @@index([type, status, createdAt])
+  @@map("transactions")
+}
+
+// ─────────────────────────── EVENTOS Y TICKETING NATIVO ───────────────────────────
+
+model Event {
+  id          String   @id @default(uuid()) @db.Uuid
+  merchantId  String?  @db.Uuid // el boliche/productora como "merchant"
+  slug        String   @unique
+  name        String
+  description String?  @db.Text
+  venue       String
+  city        String
+  coverUrl    String?
+  startsAt    DateTime
+  endsAt      DateTime?
+  isActive    Boolean  @default(true)
+  isPublished Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  merchant Merchant?     @relation(fields: [merchantId], references: [id])
+  batches  TicketBatch[]
+  tickets  EventTicket[]
+
+  @@index([isActive, isPublished, startsAt])
+  @@map("events")
+}
+
+/// Lotes/tandas de entradas (early bird, general, VIP)
+model TicketBatch {
+  id       String   @id @default(uuid()) @db.Uuid
+  eventId  String   @db.Uuid
+  name     String // "Early Bird", "General", "VIP"
+  price    Decimal  @db.Decimal(14, 2)
+  /// Margen nuestro sobre la entrada (alimenta pool + plataforma)
+  feeRate  Decimal  @default(0.1000) @db.Decimal(5, 4)
+  quantity Int
+  sold     Int      @default(0)
+  maxPerUser Int    @default(6)
+  boxTier  BoxTier  @default(SILVER) // caja que otorga comprar acá
+  isActive Boolean  @default(true)
+  salesStartAt DateTime?
+  salesEndAt   DateTime?
+
+  event   Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tickets EventTicket[]
+
+  @@index([eventId, isActive])
+  @@map("ticket_batches")
+}
+
+model EventTicket {
+  id      String       @id @default(uuid()) @db.Uuid
+  eventId String       @db.Uuid
+  batchId String       @db.Uuid
+  userId  String       @db.Uuid
+  status  TicketStatus @default(VALID)
+
+  /// Token firmado que se codifica en el QR (rotativo si se usa QR dinámico)
+  qrToken     String    @unique
+  qrSecret    String // HMAC seed para QR dinámico tipo TOTP
+  attendeeName String?
+  attendeeDoc  String?
+
+  usedAt        DateTime?
+  scannedByUserId String? @db.Uuid
+  scanLocation  String?
+
+  createdAt DateTime @default(now())
+
+  event Event       @relation(fields: [eventId], references: [id])
+  batch TicketBatch @relation(fields: [batchId], references: [id])
+  user  User        @relation(fields: [userId], references: [id])
+
+  @@index([eventId, status])
+  @@index([userId])
+  @@map("event_tickets")
+}
+
+// ─────────────────────────── PAGOS ───────────────────────────
+
+model Payment {
+  id            String          @id @default(uuid()) @db.Uuid
+  userId        String          @db.Uuid
+  transactionId String?         @unique @db.Uuid
+  provider      PaymentProvider
+  status        PaymentStatus   @default(INITIATED)
+  amount        Decimal         @db.Decimal(14, 2)
+  currency      String          @default("ARS")
+
+  externalPaymentId String?
+  preferenceId      String?
+  rawPayload        Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id])
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+
+  @@unique([provider, externalPaymentId])
+  @@index([userId, createdAt])
+  @@map("payments")
+}
+
+// ─────────────────────────── CART-TO-MYSTERY GAMBLE ───────────────────────────
+// ⚠ Módulo feature-flagged OFF por defecto — ver nota regulatoria en docs.
+
+model CartGamble {
+  id            String  @id @default(uuid()) @db.Uuid
+  userId        String  @db.Uuid
+  transactionId String? @unique @db.Uuid
+
+  /// Snapshot del carrito: [{sku, name, qty, retailPrice}]
+  cartItems   Json
+  cartValue   Decimal @db.Decimal(14, 2)
+  /// Precio que paga el usuario por convertir el carrito en caja
+  gamblePrice Decimal @db.Decimal(14, 2)
+  /// EV configurado al momento de la venta (para auditoría de RTP)
+  expectedValue Decimal @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+
+  user        User         @relation(fields: [userId], references: [id])
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+  userBox     UserBox?
+
+  @@index([userId, createdAt])
+  @@map("cart_gambles")
+}
+
+// ─────────────────────────── COMPROBANTES / OCR ───────────────────────────
+
+model ReceiptValidation {
+  id            String        @id @default(uuid()) @db.Uuid
+  userId        String        @db.Uuid
+  transactionId String?       @unique @db.Uuid
+  imageUrl      String        @db.Text
+  /// Hash perceptual (pHash) — bloquea reenvío de la misma foto recortada/editada
+  imageHash     String        @unique @db.VarChar(64)
+
+  merchantName  String?  @db.VarChar(120)
+  invoiceNumber String?  @db.VarChar(120)
+  totalAmount   Decimal? @db.Decimal(14, 2)
+  purchaseDate  DateTime?
+
+  status          ReceiptStatus @default(PROCESSING)
+  rejectionReason String?       @db.VarChar(255)
+  confidenceScore Decimal?      @db.Decimal(4, 3)
+  rawOcrResponse  Json?
+  exifData        Json?
+
+  reviewedByUserId String?   @db.Uuid
+  reviewedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+
+  /// Dos usuarios no pueden registrar la misma factura del mismo comercio
+  @@unique([merchantName, invoiceNumber], name: "unique_merchant_invoice")
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+  @@map("receipt_validations")
+}
+
+// ─────────────────────────── CATÁLOGO DE CAJAS ───────────────────────────
+
+model BoxCatalog {
+  id       String  @id @default(uuid()) @db.Uuid
+  tier     BoxTier @unique
+  name     String
+  description String? @db.Text
+  imageUrl String?
+  colorHex String  @default("#F59E0B")
+
+  /// RTP objetivo de esta caja (0.40 – 0.60). E[costo premio] ≤ rtp × comisión
+  targetRtp Decimal @default(0.5000) @db.Decimal(5, 4)
+  /// Presupuesto máximo absoluto por apertura (tope duro anti-desastre)
+  maxPayoutPerOpen Decimal @db.Decimal(14, 2)
+  /// Comisión mínima que debe haber generado la tx para otorgar esta caja
+  minCommission    Decimal @default(0) @db.Decimal(14, 2)
+  /// Monto mínimo de orden para otorgar esta caja
+  minOrderAmount   Decimal @default(0) @db.Decimal(14, 2)
+  /// Costo en saldo si la caja se compra directamente (0 = solo por compra)
+  openCost         Decimal @default(0) @db.Decimal(14, 2)
+
+  expiryDays Int     @default(30)
+  isActive   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  prizes    Prize[]
+  userBoxes UserBox[]
+
+  @@map("box_catalog")
+}
+
+model UserBox {
+  id     String        @id @default(uuid()) @db.Uuid
+  userId String        @db.Uuid
+  tier   BoxTier
+  boxCatalogId String  @db.Uuid
+  status UserBoxStatus @default(AVAILABLE)
+
+  /// Transacción que la originó (null si fue regalo/promo)
+  sourceTransactionId String? @db.Uuid
+  cartGambleId        String? @unique @db.Uuid
+
+  /// Comisión que financia esta caja: define el presupuesto de premio
+  fundingAmount Decimal @db.Decimal(14, 2)
+
+  openedAt  DateTime?
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  boxCatalog  BoxCatalog   @relation(fields: [boxCatalogId], references: [id])
+  transaction Transaction? @relation(fields: [sourceTransactionId], references: [id])
+  cartGamble  CartGamble?  @relation(fields: [cartGambleId], references: [id])
+  opening     BoxOpening?
+  reward      UserReward?
+
+  @@index([userId, status])
+  @@index([status, expiresAt])
+  @@index([sourceTransactionId])
+  @@map("user_boxes")
+}
+
+// ─────────────────────────── PREMIOS ───────────────────────────
+
+model Prize {
+  id           String    @id @default(uuid()) @db.Uuid
+  boxCatalogId String    @db.Uuid
+  name         String
+  description  String?   @db.Text
+  imageUrl     String?
+  type         PrizeType
+
+  /// Lo que REALMENTE nos cuesta (para el cálculo de RTP y solvencia)
+  realCost      Decimal @db.Decimal(14, 2)
+  /// Lo que el usuario percibe que vale (marketing)
+  perceivedValue Decimal @db.Decimal(14, 2)
+  /// Peso base para la selección ponderada (entero, mayor = más probable)
+  baseWeight    Int     @default(100)
+
+  /// Stock disponible. -1 = ilimitado (típico de cupones digitales)
+  stock         Int  @default(-1)
+  stockClaimed  Int  @default(0)
+  /// Máximo de veces que puede salir por usuario (0 = sin límite)
+  maxPerUser    Int  @default(0)
+
+  /// Multiplicador de seguridad: solo elegible si pool ≥ realCost × este valor
+  poolSafetyMultiplier Decimal @default(3.5) @db.Decimal(6, 2)
+
+  /// Datos específicos: {"couponCode":"...", "amount":500, "merchantSlug":"..."}
+  payload Json?
+
+  isActive  Boolean   @default(true)
+  isJackpot Boolean   @default(false)
+  validFrom DateTime?
+  validTo   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  boxCatalog BoxCatalog   @relation(fields: [boxCatalogId], references: [id], onDelete: Cascade)
+  rewards    UserReward[]
+  openings   BoxOpening[]
+
+  @@index([boxCatalogId, isActive])
+  @@index([type, isActive])
+  @@map("prizes")
+}
+
+/// Auditoría inmutable de cada apertura — clave para verificar RTP real y disputas
+model BoxOpening {
+  id        String @id @default(uuid()) @db.Uuid
+  userBoxId String @unique @db.Uuid
+  userId    String @db.Uuid
+  prizeId   String @db.Uuid
+
+  /// Estado del pool antes/después, para reconstruir cualquier decisión
+  poolBalanceBefore Decimal @db.Decimal(14, 2)
+  poolBalanceAfter  Decimal @db.Decimal(14, 2)
+  /// Snapshot de premios elegibles y sus pesos en ese instante
+  eligibleSnapshot  Json
+  /// Valor aleatorio usado (crypto RNG) — provably fair básico
+  randomValue       Decimal @db.Decimal(20, 18)
+  serverSeedHash    String?
+  rtpAtOpen         Decimal @db.Decimal(5, 4)
+  fundingAmount     Decimal @db.Decimal(14, 2)
+
+  ip        String?
+  createdAt DateTime @default(now())
+
+  userBox UserBox @relation(fields: [userBoxId], references: [id])
+  user    User    @relation(fields: [userId], references: [id])
+  prize   Prize   @relation(fields: [prizeId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([prizeId, createdAt])
+  @@map("box_openings")
+}
+
+model UserReward {
+  id        String       @id @default(uuid()) @db.Uuid
+  userId    String       @db.Uuid
+  prizeId   String       @db.Uuid
+  userBoxId String       @unique @db.Uuid
+  status    RewardStatus @default(LOCKED)
+
+  realCost       Decimal @db.Decimal(14, 2)
+  perceivedValue Decimal @db.Decimal(14, 2)
+
+  /// Contenido entregable: código de cupón, monto acreditado, tracking de envío
+  redemptionCode String?
+  redemptionData Json?
+
+  unlockedAt DateTime?
+  claimedAt  DateTime?
+  expiresAt  DateTime?
+  revokedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prize   Prize   @relation(fields: [prizeId], references: [id])
+  userBox UserBox @relation(fields: [userBoxId], references: [id])
+
+  @@index([userId, status])
+  @@index([status, expiresAt])
+  @@map("user_rewards")
+}
+
+// ─────────────────────────── POOL DE PREMIOS (libro contable) ───────────────────────────
+
+/// Libro inmutable. El saldo NUNCA se guarda como campo mutable:
+///   pool_available = Σ(CONTRIBUTION + PAYOUT_REVERSAL + RESERVE_RELEASE + JACKPOT_SEED + ADJUSTMENT)
+///                    − Σ(PAYOUT) − Σ(RESERVE activa)
+/// Los montos se guardan CON SIGNO (positivo entra, negativo sale).
+model PrizePoolLedger {
+  id     String          @id @default(uuid()) @db.Uuid
+  type   LedgerEntryType
+  amount Decimal         @db.Decimal(14, 2)
+
+  /// Saldo resultante tras este asiento (denormalizado para lectura rápida y auditoría)
+  balanceAfter Decimal @db.Decimal(14, 2)
+
+  transactionId String? @db.Uuid
+  userId        String? @db.Uuid
+  rewardId      String? @db.Uuid
+  boxOpeningId  String? @db.Uuid
+
+  description String?
+  createdAt   DateTime @default(now())
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+  user        User?        @relation("LedgerUser", fields: [userId], references: [id])
+
+  @@index([type, createdAt])
+  @@index([transactionId])
+  @@index([createdAt])
+  @@map("prize_pool_ledger")
+}
+
+/// Fila única (singleton) con el saldo cacheado + lock row para el unboxing.
+/// Se actualiza SIEMPRE dentro de la misma transacción SQL que escribe el ledger.
+model PoolState {
+  id String @id @default("singleton")
+
+  /// Saldo gastable ahora mismo
+  availableBalance Decimal @default(0) @db.Decimal(14, 2)
+  /// Comisiones PENDING apartadas (no gastables)
+  reservedBalance  Decimal @default(0) @db.Decimal(14, 2)
+  /// Acumulado histórico de aportes
+  lifetimeContributions Decimal @default(0) @db.Decimal(14, 2)
+  /// Acumulado histórico de premios pagados
+  lifetimePayouts       Decimal @default(0) @db.Decimal(14, 2)
+  /// Jackpot progresivo
+  jackpotBalance   Decimal @default(0) @db.Decimal(14, 2)
+  /// % de cada aporte que va al jackpot en vez del pool general
+  jackpotFeedRate  Decimal @default(0.0500) @db.Decimal(5, 4)
+  /// Colchón intocable: el pool nunca puede bajar de acá por un premio
+  reserveFloor     Decimal @default(0) @db.Decimal(14, 2)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("pool_state")
+}
+
+// ─────────────────────────── CONTROL PLANE / ADMIN ───────────────────────────
+
+/// Feature flags globales: encender/apagar módulos sin deploy
+model FeatureFlag {
+  key         String   @id // 'module.cart_gamble', 'module.ocr', 'jackpot.enabled'
+  enabled     Boolean  @default(false)
+  description String?
+  /// Config libre asociada al flag
+  config      Json?
+  updatedAt   DateTime @updatedAt
+
+  @@map("feature_flags")
+}
+
+/// Parámetros globales editables desde el panel (RTP, límites, multiplicadores)
+model SystemConfig {
+  key       String   @id // 'rtp.global_target', 'fraud.max_receipts_per_day'
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("system_config")
+}
+
+model AdminAuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  actorUserId String   @db.Uuid
+  action      String // 'merchant.toggle', 'prize.weight_update', 'receipt.approve'
+  entityType  String
+  entityId    String?
+  before      Json?
+  after       Json?
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  actor User @relation("AdminActor", fields: [actorUserId], references: [id])
+
+  @@index([actorUserId, createdAt])
+  @@index([entityType, entityId])
+  @@map("admin_audit_logs")
+}
+
+/// Idempotencia de webhooks entrantes antes de encolarlos
+model WebhookEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  source     String // 'awin', 'mercadopago', 'stripe'
+  externalId String
+  payload    Json
+  processed  Boolean  @default(false)
+  error      String?  @db.Text
+  receivedAt DateTime @default(now())
+  processedAt DateTime?
+
+  @@unique([source, externalId])
+  @@index([processed, receivedAt])
+  @@map("webhook_events")
+}

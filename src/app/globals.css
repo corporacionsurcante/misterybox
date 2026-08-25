@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/* Stack del sistema: sin descarga de fuentes, sin dependencia de red en el build. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #020617;
+  color: #f8fafc;
+  font-family: var(--font-sans);
+}
+
+/* Foco visible para navegación por teclado */
+:focus-visible {
+  outline: 2px solid #f59e0b;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
