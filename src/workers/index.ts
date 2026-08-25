@@ -45,11 +45,36 @@ function normalize(network: string, payload: Record<string, unknown>) {
     cancelled: TransactionStatus.CANCELLED,
   };
 
+  // Los montos llegan como texto y cada red usa su propio formato. Un valor
+  // como "1.234,56" o "$1200" produce NaN, y un NaN que entra al pool anula
+  // para siempre la válvula de solvencia (toda comparación con NaN da false,
+  // así que cualquier premio pasa el filtro). Se parsea con tolerancia y, si
+  // aun así no da un número, se descarta el aporte.
+  const toNumber = (raw: unknown): number => {
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : NaN;
+    if (typeof raw !== 'string') return NaN;
+    let s = raw.trim().replace(/[^0-9.,-]/g, '');
+    // Si al limpiar no queda ningún dígito, es un valor ilegible, no un cero.
+    // Devolver 0 acá haría pasar una comisión rota como "comisión cero" en vez
+    // de mandarla a revisión manual.
+    if (!/[0-9]/.test(s)) return NaN;
+    const lastComma = s.lastIndexOf(',');
+    const lastDot = s.lastIndexOf('.');
+    if (lastComma > lastDot) {
+      // formato es-AR: 1.234,56 → el separador decimal es la coma
+      s = s.replace(/\./g, '').replace(',', '.');
+    } else {
+      s = s.replace(/,/g, '');
+    }
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  };
+
   return {
     clickId: String(pick('subid1', 'sub_id', 'subId', 'click_id', 'clickId') ?? ''),
     orderId: String(pick('order_id', 'orderId', 'transaction_id', 'conversion_id') ?? ''),
-    orderAmount: Number(pick('order_value', 'amount', 'sale_amount', 'order_amount') ?? 0),
-    commission: Number(pick('commission_value', 'commission', 'payout', 'commission_amount') ?? 0),
+    orderAmount: toNumber(pick('order_value', 'amount', 'sale_amount', 'order_amount') ?? 0),
+    commission: toNumber(pick('commission_value', 'commission', 'payout', 'commission_amount') ?? 0),
     status: statusMap[rawStatus] ?? TransactionStatus.PENDING,
     network,
   };
@@ -64,6 +89,14 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
     const data = normalize(network, payload);
 
     if (!data.orderId) throw new Error('Payload sin id de orden');
+
+    if (!Number.isFinite(data.commission) || !Number.isFinite(data.orderAmount)) {
+      console.error(
+        `[webhooks] montos ilegibles en la orden ${data.orderId} (${network}). ` +
+          'Queda en webhook_events para revisión manual.',
+      );
+      return { attributed: false, reason: 'montos-invalidos' };
+    }
 
     // 1. Atribuir al usuario vía el click original
     const click = data.clickId
@@ -164,8 +197,10 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
       console.log(`[webhooks] caja ${boxId} otorgada a ${click.userId}`);
     }
 
+    // La clave del evento incluye el estado (ver el route del webhook), así que
+    // se marca por prefijo de orden para no dejar filas colgadas.
     await prisma.webhookEvent.updateMany({
-      where: { source: network, externalId: data.orderId },
+      where: { source: network, externalId: { startsWith: `${data.orderId}:` } },
       data: { processed: true, processedAt: new Date() },
     });
 

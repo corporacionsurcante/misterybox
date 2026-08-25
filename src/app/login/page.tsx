@@ -10,8 +10,16 @@ export default async function LoginPage({
   searchParams: Promise<{ next?: string }>;
 }) {
   const { next } = await searchParams;
+
+  // Sólo rutas internas. Sin este filtro, un link como
+  // /login?next=https://sitio-falso.com sacaba al usuario del dominio real
+  // desde una URL legítima — la base de un phishing convincente.
+  // El doble slash inicial también hay que bloquearlo: //evil.com es una URL
+  // protocol-relative y el navegador la trata como externa.
+  const destino = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+
   const session = await auth();
-  if (session?.user) redirect(next ?? '/');
+  if (session?.user) redirect(destino);
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-950 px-6">
@@ -25,7 +33,7 @@ export default async function LoginPage({
         <form
           action={async () => {
             'use server';
-            await signIn('google', { redirectTo: next ?? '/' });
+            await signIn('google', { redirectTo: destino });
           }}
         >
           <button

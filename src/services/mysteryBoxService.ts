@@ -24,6 +24,7 @@ import {
   UserBoxStatus,
   LedgerEntryType,
   TransactionStatus,
+  WalletTxType,
 } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
 
@@ -404,10 +405,16 @@ export async function openMysteryBox(input: OpenBoxInput): Promise<OpenBoxResult
           data: {
             type: LedgerEntryType.PAYOUT,
             amount: money(-won.realCost),
-            balanceAfter: money(newAvailable),
+            // Un premio de jackpot sale de `jackpotBalance`, no del pool general.
+            // Asentar acá el saldo del pool general (que no se movió) rompía la
+            // cadena del libro: reconstruir el saldo sumando asientos daba un
+            // número distinto al de pool_state, y la contabilidad dejaba de cuadrar.
+            balanceAfter: money(won.isJackpot ? newJackpot : newAvailable),
             userId,
             transactionId: box.sourceTransactionId,
-            description: `Premio "${won.name}" (caja ${box.tier})`,
+            description: won.isJackpot
+              ? `JACKPOT "${won.name}" (bolsa de jackpot)`
+              : `Premio "${won.name}" (caja ${box.tier})`,
           },
         });
       }
@@ -543,7 +550,21 @@ export async function contributeToPool(params: {
   userId: string;
 }): Promise<void> {
   const { transactionId, amount, status, userId } = params;
-  if (amount <= 0) return;
+
+  // `amount` viene de parsear el payload de una red de afiliados. Un formato
+  // inesperado ("1.234,56", "$1200") produce NaN, y `NaN <= 0` es false: sin
+  // este chequeo el NaN entraba al saldo del pool y quedaba pegado ahí. A
+  // partir de ese momento toda comparación de solvencia da false y CUALQUIER
+  // premio pasa el filtro — la válvula anti-insolvencia queda anulada y no se
+  // recupera sin cirugía manual en la base.
+  if (!Number.isFinite(amount) || amount <= 0) {
+    if (!Number.isFinite(amount)) {
+      console.error(
+        `[pool] aporte descartado por monto inválido (${amount}) en la tx ${transactionId}`,
+      );
+    }
+    return;
+  }
 
   await prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT id FROM pool_state WHERE id = 'singleton' FOR UPDATE`;
@@ -571,19 +592,42 @@ export async function contributeToPool(params: {
     if (status === TransactionStatus.APPROVED) {
       const toJackpot = amount * d(pool.jackpotFeedRate);
       const toPool = amount - toJackpot;
+      const newJackpot = d(pool.jackpotBalance) + toJackpot;
 
       const newAvailable = d(pool.availableBalance) + toPool;
-      const newReserved = Math.max(0, d(pool.reservedBalance) - amount);
+
+      // Sólo se libera reserva si esta transacción efectivamente tenía una.
+      // Restar a ciegas del saldo global le comía la reserva a otras
+      // transacciones pendientes cuando el primer postback llegaba ya aprobado.
+      const hadReserve = await tx.prizePoolLedger.findFirst({
+        where: { transactionId, type: LedgerEntryType.RESERVE },
+      });
+      const newReserved = hadReserve
+        ? Math.max(0, d(pool.reservedBalance) - amount)
+        : d(pool.reservedBalance);
 
       await tx.poolState.update({
         where: { id: 'singleton' },
         data: {
           availableBalance: money(newAvailable),
           reservedBalance: money(newReserved),
-          jackpotBalance: money(d(pool.jackpotBalance) + toJackpot),
+          jackpotBalance: money(newJackpot),
           lifetimeContributions: money(d(pool.lifetimeContributions) + amount),
         },
       });
+
+      if (hadReserve) {
+        await tx.prizePoolLedger.create({
+          data: {
+            type: LedgerEntryType.RESERVE_RELEASE,
+            amount: money(-amount),
+            balanceAfter: money(newAvailable),
+            transactionId,
+            userId,
+            description: 'Reserva liberada: comisión confirmada',
+          },
+        });
+      }
 
       await tx.prizePoolLedger.create({
         data: {
@@ -592,9 +636,25 @@ export async function contributeToPool(params: {
           balanceAfter: money(newAvailable),
           transactionId,
           userId,
-          description: `Comisión aprobada (jackpot: ${toJackpot.toFixed(2)})`,
+          description: 'Comisión aprobada al pool general',
         },
       });
+
+      // El 5% que va al jackpot necesita su propio asiento: sin él, esa plata
+      // entraba a pool_state sin dejar rastro en el libro y las dos fuentes
+      // dejaban de cuadrar.
+      if (toJackpot > 0) {
+        await tx.prizePoolLedger.create({
+          data: {
+            type: LedgerEntryType.JACKPOT_SEED,
+            amount: money(toJackpot),
+            balanceAfter: money(newJackpot),
+            transactionId,
+            userId,
+            description: 'Aporte al jackpot progresivo',
+          },
+        });
+      }
     }
   });
 }
@@ -603,7 +663,15 @@ export async function contributeToPool(params: {
 // LIBERACIÓN Y REVOCACIÓN DE ESCROW
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** La comisión se aprobó → los premios LOCKED de esa tx pasan a UNLOCKED. */
+/**
+ * La comisión se aprobó → los premios LOCKED de esa tx pasan a UNLOCKED.
+ *
+ * Cada premio se libera con un compare-and-set (`updateMany` filtrando por
+ * status LOCKED). Sin eso, dos ejecuciones concurrentes —el cron horario
+ * solapado con el webhook de aprobación, o dos réplicas del worker— leerían el
+ * mismo premio LOCKED y ambas acreditarían el saldo: el usuario cobraría dos
+ * veces y `balanceLocked` quedaría negativo.
+ */
 export async function releaseEscrowForTransaction(transactionId: string): Promise<number> {
   return prisma.$transaction(async (tx) => {
     const rewards = await tx.userReward.findMany({
@@ -611,11 +679,17 @@ export async function releaseEscrowForTransaction(transactionId: string): Promis
       include: { prize: true },
     });
 
+    let released = 0;
+
     for (const r of rewards) {
-      await tx.userReward.update({
-        where: { id: r.id },
+      // Compare-and-set: sólo gana la primera ejecución que lo encuentre LOCKED.
+      const claimed = await tx.userReward.updateMany({
+        where: { id: r.id, status: RewardStatus.LOCKED },
         data: { status: RewardStatus.UNLOCKED, unlockedAt: new Date() },
       });
+      if (claimed.count === 0) continue; // otra ejecución ya lo liberó
+
+      released++;
 
       if (r.prize.type === PrizeType.WALLET_CASH || r.prize.type === PrizeType.CASHBACK_REFUND) {
         const amount = r.realCost;
@@ -638,7 +712,7 @@ export async function releaseEscrowForTransaction(transactionId: string): Promis
         });
       }
     }
-    return rewards.length;
+    return released;
   });
 }
 
@@ -651,35 +725,82 @@ export async function revokeEscrowForTransaction(
     await tx.$queryRaw`SELECT id FROM pool_state WHERE id = 'singleton' FOR UPDATE`;
     const pool = await tx.poolState.findUniqueOrThrow({ where: { id: 'singleton' } });
 
-    // Cajas no abiertas → revocadas
+    const trx = await tx.transaction.findUnique({ where: { id: transactionId } });
+    if (!trx) return;
+
+    // Cajas todavía sin abrir → revocadas
     await tx.userBox.updateMany({
       where: { sourceTransactionId: transactionId, status: UserBoxStatus.AVAILABLE },
       data: { status: UserBoxStatus.REVOKED },
     });
 
-    // Premios aún bloqueados → revocados y su costo vuelve al pool
-    const locked = await tx.userReward.findMany({
-      where: { status: RewardStatus.LOCKED, userBox: { sourceTransactionId: transactionId } },
+    // Se revocan los premios LOCKED **y** los UNLOCKED que el usuario todavía no
+    // canjeó. Limitarlo a LOCKED dejaba abierto el farmeo comprar-y-devolver:
+    // si la comisión llegaba ya aprobada, el premio nacía UNLOCKED, el usuario
+    // devolvía la compra y se quedaba con el saldo igual.
+    // Los CLAIMED no se tocan: ya se entregaron, revertirlos sería quitarle al
+    // usuario algo que ya usó. Esa pérdida se asume y queda registrada.
+    const revocables = await tx.userReward.findMany({
+      where: {
+        status: { in: [RewardStatus.LOCKED, RewardStatus.UNLOCKED] },
+        userBox: { sourceTransactionId: transactionId },
+      },
       include: { prize: true },
     });
 
     let restored = d(pool.availableBalance);
-    for (const r of locked) {
-      await tx.userReward.update({
-        where: { id: r.id },
+    let restoredJackpot = d(pool.jackpotBalance);
+
+    for (const r of revocables) {
+      // Compare-and-set: no revocar algo que se canjeó mientras leíamos.
+      const claimed = await tx.userReward.updateMany({
+        where: { id: r.id, status: { in: [RewardStatus.LOCKED, RewardStatus.UNLOCKED] } },
         data: { status: RewardStatus.REVOKED, revokedReason: reason },
       });
+      if (claimed.count === 0) continue;
 
+      const cost = d(r.realCost);
+
+      // Devolver el saldo acreditado, del bucket que corresponda
       if (r.prize.type === PrizeType.WALLET_CASH || r.prize.type === PrizeType.CASHBACK_REFUND) {
-        await tx.user.update({
-          where: { id: r.userId },
-          data: { balanceLocked: { decrement: r.realCost } },
+        if (r.status === RewardStatus.LOCKED) {
+          await tx.user.update({
+            where: { id: r.userId },
+            data: { balanceLocked: { decrement: r.realCost } },
+          });
+        } else {
+          const user = await tx.user.update({
+            where: { id: r.userId },
+            data: { balanceAvailable: { decrement: r.realCost } },
+          });
+          await tx.walletTransaction.create({
+            data: {
+              userId: r.userId,
+              type: WalletTxType.REFUND,
+              amount: money(-cost),
+              balanceAfter: user.balanceAvailable,
+              description: `Premio anulado: ${r.prize.name} (${reason})`,
+              rewardId: r.id,
+            },
+          });
+        }
+      }
+
+      // Devolver el stock consumido: un reembolso no debe quemar una unidad
+      // de un premio con stock limitado.
+      if (r.prize.stock !== -1) {
+        await tx.prize.update({
+          where: { id: r.prize.id },
+          data: { stockClaimed: { decrement: 1 } },
         });
       }
 
-      const cost = d(r.realCost);
-      if (cost > 0 && !r.prize.isJackpot) {
-        restored += cost;
+      if (cost > 0) {
+        if (r.prize.isJackpot) {
+          restoredJackpot += cost;
+        } else {
+          restored += cost;
+        }
         await tx.prizePoolLedger.create({
           data: {
             type: LedgerEntryType.PAYOUT_REVERSAL,
@@ -693,27 +814,54 @@ export async function revokeEscrowForTransaction(
       }
     }
 
-    // Anular la reserva de la comisión que nunca se va a cobrar
-    const trx = await tx.transaction.findUnique({ where: { id: transactionId } });
-    const reserved = trx ? d(trx.poolContribution) : 0;
-    const newReserved = Math.max(0, d(pool.reservedBalance) - reserved);
+    // ── Revertir el aporte de la comisión al pool ──
+    // Según en qué estado estaba la transacción, ese aporte vive en un lugar
+    // distinto. Restar siempre de `reservedBalance` (como se hacía antes) tenía
+    // dos efectos malos a la vez: le comía reserva a transacciones ajenas, y
+    // dejaba en `availableBalance` una comisión que el comercio ya recuperó —
+    // o sea, el pool declaraba plata inexistente y la repartía en premios.
+    const contribution = d(trx.poolContribution);
+    let newReserved = d(pool.reservedBalance);
+
+    if (contribution > 0) {
+      if (trx.status === TransactionStatus.APPROVED) {
+        // Ya había pasado a gastable (menos la parte que fue al jackpot)
+        const toJackpot = contribution * d(pool.jackpotFeedRate);
+        restored -= contribution - toJackpot;
+        restoredJackpot -= toJackpot;
+
+        await tx.prizePoolLedger.create({
+          data: {
+            type: LedgerEntryType.ADJUSTMENT,
+            amount: money(-(contribution - toJackpot)),
+            balanceAfter: money(restored),
+            transactionId,
+            description: `Reverso de comisión ya acreditada: ${reason}`,
+          },
+        });
+      } else {
+        // Seguía apartada como reserva
+        newReserved = Math.max(0, newReserved - contribution);
+        await tx.prizePoolLedger.create({
+          data: {
+            type: LedgerEntryType.RESERVE_REVERSAL,
+            amount: money(-contribution),
+            balanceAfter: money(restored),
+            transactionId,
+            description: reason,
+          },
+        });
+      }
+    }
 
     await tx.poolState.update({
       where: { id: 'singleton' },
-      data: { availableBalance: money(restored), reservedBalance: money(newReserved) },
+      data: {
+        availableBalance: money(restored),
+        reservedBalance: money(newReserved),
+        jackpotBalance: money(Math.max(0, restoredJackpot)),
+      },
     });
-
-    if (reserved > 0) {
-      await tx.prizePoolLedger.create({
-        data: {
-          type: LedgerEntryType.RESERVE_REVERSAL,
-          amount: money(-reserved),
-          balanceAfter: money(restored),
-          transactionId,
-          description: reason,
-        },
-      });
-    }
   });
 }
 
@@ -742,27 +890,44 @@ export async function assignMysteryBoxToUser(params: {
 }): Promise<string | null> {
   const { userId, transactionId, commission, orderAmount, poolShareRate = 0.5 } = params;
 
+  if (!Number.isFinite(commission) || !Number.isFinite(orderAmount)) {
+    console.error(`[cajas] montos inválidos en la tx ${transactionId}, no se otorga caja`);
+    return null;
+  }
+
   const catalog = await resolveTier(commission, orderAmount);
   if (!catalog) return null;
 
   // Lo que financia el premio es la parte de la comisión destinada al pool
   const fundingAmount = commission * poolShareRate;
 
-  const box = await prisma.userBox.create({
-    data: {
-      userId,
-      tier: catalog.tier,
-      boxCatalogId: catalog.id,
-      sourceTransactionId: transactionId,
-      fundingAmount: money(fundingAmount),
-      expiresAt: new Date(Date.now() + catalog.expiryDays * 24 * 60 * 60 * 1000),
-    },
-  });
+  // Crear la caja y marcar la transacción van en la MISMA transacción SQL, y
+  // el marcado es un compare-and-set sobre boxGranted.
+  //
+  // Antes eran dos statements sueltos: si el worker moría entre ambos, BullMQ
+  // reintentaba el job, encontraba boxGranted todavía en false y creaba una
+  // SEGUNDA caja con el presupuesto completo. Una comisión terminaba
+  // financiando dos cajas, y el RTP efectivo se duplicaba en silencio.
+  return prisma.$transaction(async (tx) => {
+    const marked = await tx.transaction.updateMany({
+      where: { id: transactionId, boxGranted: false },
+      data: { boxGranted: true },
+    });
 
-  await prisma.transaction.update({
-    where: { id: transactionId },
-    data: { boxGranted: true },
-  });
+    // Otra ejecución ya otorgó la caja de esta transacción.
+    if (marked.count === 0) return null;
 
-  return box.id;
+    const box = await tx.userBox.create({
+      data: {
+        userId,
+        tier: catalog.tier,
+        boxCatalogId: catalog.id,
+        sourceTransactionId: transactionId,
+        fundingAmount: money(fundingAmount),
+        expiresAt: new Date(Date.now() + catalog.expiryDays * 24 * 60 * 60 * 1000),
+      },
+    });
+
+    return box.id;
+  });
 }

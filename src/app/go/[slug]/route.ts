@@ -44,8 +44,19 @@ export async function GET(req: Request, ctx: { params: Promise<{ slug: string }>
     },
   });
 
-  // Sustituye los placeholders de la plantilla del comercio
-  const destination = (merchant.affiliateUrlTemplate ?? target)
+  // Sin plantilla de afiliado no hay a dónde redirigir de forma segura.
+  //
+  // Antes se caía a `target`, un parámetro que viene del cliente sin validar:
+  // /go/<comercio-sin-plantilla>?target=https://sitio-falso.com redirigía a
+  // donde quisiera el atacante, con la credibilidad de nuestro dominio. Hoy
+  // los comercios del seed traen plantilla, pero cualquiera cargado después
+  // desde el panel no la tiene.
+  if (!merchant.affiliateUrlTemplate) {
+    console.error(`[go] el comercio ${merchant.slug} no tiene affiliateUrlTemplate configurada`);
+    return NextResponse.redirect(new URL('/tiendas?error=comercio-mal-configurado', req.url));
+  }
+
+  const destination = merchant.affiliateUrlTemplate
     .replace('{{CLICK_ID}}', click.id)
     .replace('{{TARGET}}', encodeURIComponent(target));
 
