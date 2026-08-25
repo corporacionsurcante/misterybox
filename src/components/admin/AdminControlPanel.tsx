@@ -17,7 +17,7 @@ import { useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Activity, Store, Gift, TrendingUp, TrendingDown, Wallet, Lock,
-  AlertTriangle, Power, Save, RefreshCw,
+  AlertTriangle, Power, Save, RefreshCw, CreditCard,
 } from 'lucide-react';
 
 // ─────────────────────────── Tipos ───────────────────────────
@@ -124,6 +124,12 @@ export default function AdminControlPanel({
               {metrics.receiptsInReview} comprobantes en revisión
             </a>
           )}
+          <a
+            href="/admin/planes"
+            className="flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:bg-slate-800"
+          >
+            <CreditCard className="h-4 w-4" /> Planes de suscripción
+          </a>
           <button
             onClick={onRefresh}
             className="flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:bg-slate-800"
