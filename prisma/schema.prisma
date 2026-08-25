@@ -159,7 +159,7 @@ model User {
   emailVerified DateTime?
   phone         String?    @unique // WhatsApp / magic link SMS
   name          String?
-  avatarUrl     String?
+  image         String?
   role          UserRole   @default(USER)
   status        UserStatus @default(ACTIVE)
 
@@ -205,23 +205,39 @@ model User {
 }
 
 /// OAuth (Google) — compatible con Auth.js
+/// ATENCION: los nombres de estos campos los define @auth/prisma-adapter.
+/// Tienen que ser exactamente estos (incluido el snake_case y el campo `type`)
+/// o el login falla con "problema con la configuracion del servidor" cuando
+/// Google devuelve el callback y el adaptador intenta guardar la cuenta.
 model Account {
   id                String  @id @default(uuid()) @db.Uuid
   userId            String  @db.Uuid
+  type              String
   provider          String
   providerAccountId String
-  refreshToken      String? @db.Text
-  accessToken       String? @db.Text
-  expiresAt         Int?
-  tokenType         String?
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
   scope             String?
-  idToken           String? @db.Text
+  id_token          String? @db.Text
+  session_state     String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([provider, providerAccountId])
   @@index([userId])
   @@map("accounts")
+}
+
+/// Requerido por @auth/prisma-adapter aunque hoy solo usemos Google.
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
 }
 
 model Session {

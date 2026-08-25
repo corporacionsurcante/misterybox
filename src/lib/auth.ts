@@ -6,6 +6,9 @@ import { UserRole, UserStatus } from '@/generated/prisma/client';
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   adapter: PrismaAdapter(prisma) as never,
+  // Vercel sirve la app detrás de su proxy: sin esto, Auth.js puede rechazar
+  // el host del callback y responder "problema con la configuración".
+  trustHost: true,
   session: {
     strategy: 'jwt',
     // 7 días en vez de los 30 por defecto: acota la ventana en la que un token
