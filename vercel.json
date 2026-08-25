@@ -1,4 +1,4 @@
 {
-  "buildCommand": "prisma generate && prisma db push --skip-generate && next build",
+  "buildCommand": "prisma db push && prisma generate && next build",
   "framework": "nextjs"
 }
