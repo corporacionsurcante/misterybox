@@ -12,10 +12,15 @@ export default async function AbrirCajaPage({ params }: { params: Promise<{ id: 
   const session = await auth();
   if (!session?.user?.id) redirect(`/login?next=/cajas/${id}`);
 
-  const box = await prisma.userBox.findFirst({
-    where: { id, userId: session.user.id },
-    include: { boxCatalog: true },
-  });
+  const [box, cajasRestantes] = await Promise.all([
+    prisma.userBox.findFirst({
+      where: { id, userId: session.user.id },
+      include: { boxCatalog: true },
+    }),
+    prisma.userBox.count({
+      where: { userId: session.user.id, status: 'AVAILABLE', id: { not: id } },
+    }),
+  ]);
 
   if (!box) notFound();
 
@@ -33,7 +38,11 @@ export default async function AbrirCajaPage({ params }: { params: Promise<{ id: 
           <ArrowLeft className="h-4 w-4" /> Volver a mis cajas
         </Link>
 
-        <MysteryBoxUnboxer userBoxId={box.id} tier={box.tier as BoxTier} />
+        <MysteryBoxUnboxer
+          userBoxId={box.id}
+          tier={box.tier as BoxTier}
+          cajasRestantes={cajasRestantes}
+        />
       </div>
     </main>
   );

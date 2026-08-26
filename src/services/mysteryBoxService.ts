@@ -27,6 +27,7 @@ import {
   WalletTxType,
 } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
+import { conReintento } from '@/lib/dbRetry';
 
 // ─────────────────────────── Tipos ───────────────────────────
 
@@ -566,9 +567,22 @@ export async function contributeToPool(params: {
     return;
   }
 
-  await prisma.$transaction(async (tx) => {
+  await conReintento(() => prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT id FROM pool_state WHERE id = 'singleton' FOR UPDATE`;
     const pool = await tx.poolState.findUniqueOrThrow({ where: { id: 'singleton' } });
+
+    // Idempotencia: si ya existe el asiento de este tipo para esta transacción,
+    // el aporte ya se hizo. Un reintento del worker, o una secuencia de estados
+    // que vuelve a pasar por aprobado, sumaría la comisión de nuevo.
+    const tipoAsiento =
+      status === TransactionStatus.PENDING
+        ? LedgerEntryType.RESERVE
+        : LedgerEntryType.CONTRIBUTION;
+
+    const yaAportado = await tx.prizePoolLedger.findFirst({
+      where: { transactionId, type: tipoAsiento },
+    });
+    if (yaAportado) return;
 
     if (status === TransactionStatus.PENDING) {
       const reserved = d(pool.reservedBalance) + amount;
@@ -602,8 +616,13 @@ export async function contributeToPool(params: {
       const hadReserve = await tx.prizePoolLedger.findFirst({
         where: { transactionId, type: LedgerEntryType.RESERVE },
       });
+      // Se libera exactamente lo que se había reservado, no el monto del
+      // postback actual: las redes corrigen los montos entre el aviso
+      // pendiente y el aprobado, y liberar de menos dejaba plata apartada
+      // para siempre, mientras que liberar de más comía reservas ajenas.
+      const montoReservado = hadReserve ? d(hadReserve.amount) : 0;
       const newReserved = hadReserve
-        ? Math.max(0, d(pool.reservedBalance) - amount)
+        ? Math.max(0, d(pool.reservedBalance) - montoReservado)
         : d(pool.reservedBalance);
 
       await tx.poolState.update({
@@ -620,7 +639,7 @@ export async function contributeToPool(params: {
         await tx.prizePoolLedger.create({
           data: {
             type: LedgerEntryType.RESERVE_RELEASE,
-            amount: money(-amount),
+            amount: money(-montoReservado),
             balanceAfter: money(newAvailable),
             transactionId,
             userId,
@@ -656,7 +675,7 @@ export async function contributeToPool(params: {
         });
       }
     }
-  });
+  }), { etiqueta: 'contributeToPool' });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -720,8 +739,18 @@ export async function releaseEscrowForTransaction(transactionId: string): Promis
 export async function revokeEscrowForTransaction(
   transactionId: string,
   reason = 'Compra cancelada o reembolsada por el comercio',
+  /**
+   * Estado que tenía la transacción ANTES de marcarla como reembolsada.
+   *
+   * Es obligatorio pasarlo: quien llama ya actualizó el estado en la base, así
+   * que releerlo devuelve REFUNDED y no dice de qué bucket hay que sacar la
+   * comisión. Sin este dato, una comisión ya acreditada se restaba de las
+   * reservas (comiéndose las de otras transacciones) y quedaba para siempre
+   * dentro del saldo gastable del pool.
+   */
+  estadoPrevio?: TransactionStatus,
 ): Promise<void> {
-  await prisma.$transaction(async (tx) => {
+  await conReintento(() => prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT id FROM pool_state WHERE id = 'singleton' FOR UPDATE`;
     const pool = await tx.poolState.findUniqueOrThrow({ where: { id: 'singleton' } });
 
@@ -824,7 +853,10 @@ export async function revokeEscrowForTransaction(
     let newReserved = d(pool.reservedBalance);
 
     if (contribution > 0) {
-      if (trx.status === TransactionStatus.APPROVED) {
+      // El estado que importa es el PREVIO, no el actual (que ya es REFUNDED).
+      const estadoParaRevertir = estadoPrevio ?? trx.status;
+
+      if (estadoParaRevertir === TransactionStatus.APPROVED) {
         // Ya había pasado a gastable (menos la parte que fue al jackpot)
         const toJackpot = contribution * d(pool.jackpotFeedRate);
         restored -= contribution - toJackpot;
@@ -857,12 +889,23 @@ export async function revokeEscrowForTransaction(
     await tx.poolState.update({
       where: { id: 'singleton' },
       data: {
-        availableBalance: money(restored),
+        // El pool nunca puede quedar negativo: si la reversión excede lo
+        // disponible es que ya se pagaron premios con esa plata. Se clampea y
+        // se registra, porque un saldo negativo rompe todos los cálculos aguas
+        // abajo.
+        availableBalance: money(Math.max(0, restored)),
         reservedBalance: money(newReserved),
         jackpotBalance: money(Math.max(0, restoredJackpot)),
       },
     });
-  });
+
+    if (restored < 0) {
+      console.error(
+        `[pool] la reversión de la tx ${transactionId} excede el saldo disponible ` +
+          `(${restored.toFixed(2)}). Ya se pagaron premios con esa comisión.`,
+      );
+    }
+  }), { etiqueta: 'revokeEscrow' });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

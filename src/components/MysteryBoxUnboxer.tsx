@@ -13,6 +13,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
+import { useRouter } from 'next/navigation';
 import { Gift, Lock, Sparkles, X, Copy, Check, Wallet, Ticket, Package, Percent } from 'lucide-react';
 
 // ─────────────────────────── Tipos (espejo del backend) ───────────────────────────
@@ -50,6 +51,8 @@ interface Props {
   onOpen?: (userBoxId: string) => Promise<UnboxResult>;
   onRevealed?: (result: UnboxResult) => void;
   onClose?: () => void;
+  /** Cuántas cajas sin abrir le quedan al usuario después de esta */
+  cajasRestantes?: number;
 }
 
 type Phase = 'IDLE' | 'SHAKING' | 'BURST' | 'REVEAL' | 'ERROR';
@@ -158,7 +161,15 @@ const haptic = (pattern: number | number[]) => {
 
 // ─────────────────────────── Componente ───────────────────────────
 
-export default function MysteryBoxUnboxer({ userBoxId, tier, onOpen, onRevealed, onClose }: Props) {
+export default function MysteryBoxUnboxer({
+  userBoxId,
+  tier,
+  onOpen,
+  onRevealed,
+  onClose,
+  cajasRestantes = 0,
+}: Props) {
+  const router = useRouter();
   const [phase, setPhase] = useState<Phase>('IDLE');
   const [result, setResult] = useState<UnboxResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -212,9 +223,15 @@ export default function MysteryBoxUnboxer({ userBoxId, tier, onOpen, onRevealed,
 
   const copyCode = async () => {
     if (!result?.redemptionCode) return;
-    await navigator.clipboard.writeText(result.redemptionCode);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(result.redemptionCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // El portapapeles puede fallar dentro de una app o sin HTTPS. El código
+      // igual se puede seleccionar a mano, así que no se bloquea nada.
+      console.warn('No se pudo copiar al portapapeles');
+    }
   };
 
   return (
@@ -285,7 +302,9 @@ export default function MysteryBoxUnboxer({ userBoxId, tier, onOpen, onRevealed,
             onClick={handleOpen}
             whileHover={{ scale: 1.04 }}
             whileTap={{ scale: 0.96 }}
-            className={`rounded-full bg-gradient-to-r px-10 py-4 text-lg font-bold text-white transition-shadow ${style.grad} ${style.glow} focus:outline-none focus:ring-4 focus:ring-white/30`}
+            // Texto oscuro: sobre los gradientes plata y oro el blanco quedaba
+            // con contraste ~1,2:1, prácticamente invisible.
+            className={`rounded-full bg-gradient-to-r px-10 py-4 text-lg font-bold text-slate-900 transition-shadow ${style.grad} ${style.glow}`}
           >
             Abrir Mystery Box
           </motion.button>
@@ -293,6 +312,8 @@ export default function MysteryBoxUnboxer({ userBoxId, tier, onOpen, onRevealed,
 
         {phase === 'SHAKING' && (
           <motion.p
+            role="status"
+            aria-live="polite"
             className="text-sm font-medium uppercase tracking-[0.3em] text-white/70"
             animate={{ opacity: [0.35, 1, 0.35] }}
             transition={{ duration: 1.1, repeat: Infinity }}
@@ -303,7 +324,7 @@ export default function MysteryBoxUnboxer({ userBoxId, tier, onOpen, onRevealed,
 
         {phase === 'ERROR' && (
           <div className="text-center">
-            <p className="mb-3 text-sm text-red-300">{error}</p>
+            <p role="alert" className="mb-3 text-sm text-red-300">{error}</p>
             <button
               onClick={() => setPhase('IDLE')}
               className="rounded-full border border-white/20 px-5 py-2 text-sm text-white/80 hover:bg-white/10"
@@ -322,9 +343,13 @@ export default function MysteryBoxUnboxer({ userBoxId, tier, onOpen, onRevealed,
             tier={tier}
             copied={copied}
             onCopy={copyCode}
+            cajasRestantes={cajasRestantes}
             onClose={() => {
-              setPhase('IDLE');
+              // No se vuelve a IDLE: eso dejaba al usuario frente al botón
+              // "Abrir" de una caja que ya abrió, y al tocarlo el servidor le
+              // respondía que la caja no era suya.
               onClose?.();
+              router.push(cajasRestantes > 0 ? '/cajas' : '/billetera');
             }}
           />
         )}
@@ -341,12 +366,14 @@ function RevealModal({
   copied,
   onCopy,
   onClose,
+  cajasRestantes,
 }: {
   result: UnboxResult;
   tier: BoxTier;
   copied: boolean;
   onCopy: () => void;
   onClose: () => void;
+  cajasRestantes: number;
 }) {
   const style = TIER_STYLE[tier];
   const Icon = PRIZE_ICON[result.prize.type] ?? Gift;
@@ -370,7 +397,7 @@ function RevealModal({
       aria-labelledby="prize-title"
     >
       <motion.div
-        className="relative w-full max-w-sm overflow-hidden rounded-3xl border border-white/10 bg-slate-900 p-8 text-center"
+        className="relative max-h-[85vh] w-full max-w-sm overflow-y-auto rounded-3xl border border-white/10 bg-slate-900 p-8 text-center"
         initial={{ scale: 0.6, y: 40, opacity: 0 }}
         animate={{ scale: 1, y: 0, opacity: 1 }}
         exit={{ scale: 0.8, opacity: 0 }}
@@ -422,7 +449,7 @@ function RevealModal({
             onClick={onCopy}
             className="mb-5 flex w-full items-center justify-between gap-3 rounded-xl border border-dashed border-white/25 bg-white/5 px-4 py-3 transition hover:bg-white/10"
           >
-            <code className="font-mono text-sm tracking-wider text-white">{result.redemptionCode}</code>
+            <code className="select-all font-mono text-sm tracking-wider text-white">{result.redemptionCode}</code>
             {copied ? (
               <Check className="h-4 w-4 shrink-0 text-emerald-400" />
             ) : (
@@ -454,7 +481,9 @@ function RevealModal({
           onClick={onClose}
           className="mt-5 w-full rounded-full bg-white py-3 font-semibold text-slate-900 transition hover:bg-white/90"
         >
-          Continuar
+          {cajasRestantes > 0
+            ? `Abrir otra caja (${cajasRestantes})`
+            : 'Ver mi billetera'}
         </button>
       </motion.div>
     </motion.div>
@@ -465,12 +494,17 @@ function RevealModal({
 
 function AmbientGlow({ tier, active }: { tier: BoxTier; active: boolean }) {
   const style = TIER_STYLE[tier];
+  const quieto = useReducedMotion();
   return (
     <motion.div
       aria-hidden
       className={`pointer-events-none absolute left-1/2 top-1/3 h-[420px] w-[420px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-gradient-to-br blur-[100px] ${style.grad}`}
-      animate={{ opacity: active ? [0.25, 0.5, 0.25] : 0.18, scale: active ? [1, 1.15, 1] : 1 }}
-      transition={{ duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
+      animate={
+        quieto
+          ? { opacity: 0.2, scale: 1 }
+          : { opacity: active ? [0.25, 0.5, 0.25] : 0.18, scale: active ? [1, 1.15, 1] : 1 }
+      }
+      transition={quieto ? { duration: 0 } : { duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
     />
   );
 }

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { currentUser } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { rateLimit, getClientIp } from '@/lib/rateLimit';
-import { crearSuscripcionEnMP, crearPlanEnMP } from '@/lib/mercadopago';
+import { crearSuscripcionEnMP, crearPlanEnMP, cancelarSuscripcionEnMP } from '@/lib/mercadopago';
 import { SubscriptionStatus } from '@/generated/prisma/client';
 
 export const runtime = 'nodejs';
@@ -63,6 +63,7 @@ export async function POST(req: Request) {
       planId: plan.id,
       status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.PENDING] },
     },
+    orderBy: { createdAt: 'desc' },
   });
 
   if (existente?.status === SubscriptionStatus.ACTIVE) {
@@ -104,6 +105,26 @@ export async function POST(req: Request) {
         },
       }));
 
+    // Si esta suscripción ya tenía una autorización pendiente en Mercado Pago,
+    // hay que cancelarla antes de crear otra.
+    //
+    // El link de checkout anterior sigue vivo: si el usuario lo abre desde una
+    // pestaña vieja o desde el mail de Mercado Pago y lo autoriza, ese débito
+    // apunta a un identificador que acá ya fue reemplazado. El cobro llega
+    // todos los meses, el cliente paga, y no recibe ni la suscripción activa
+    // ni una sola caja.
+    if (existente?.mpPreapprovalId) {
+      try {
+        await cancelarSuscripcionEnMP(existente.mpPreapprovalId);
+        console.log(`[sub] cancelada la autorización previa ${existente.mpPreapprovalId}`);
+      } catch (e) {
+        console.warn(
+          `[sub] no se pudo cancelar la autorización previa ${existente.mpPreapprovalId}`,
+          e,
+        );
+      }
+    }
+
     const { id: preapprovalId, initPoint } = await crearSuscripcionEnMP({
       planIdMP,
       emailPagador: user.email,
@@ -120,6 +141,16 @@ export async function POST(req: Request) {
     return NextResponse.json({ url: initPoint, subscriptionId: suscripcion.id });
   } catch (err) {
     const mensaje = err instanceof Error ? err.message : 'error desconocido';
+
+    // El unique (userId, planId) frena el doble clic: dos pedidos concurrentes
+    // creaban dos autorizaciones en Mercado Pago y le debitaban dos veces.
+    if (mensaje.includes('Unique constraint') || (err as { code?: string })?.code === 'P2002') {
+      return NextResponse.json(
+        { error: 'Ya tenés una suscripción a este plan en curso. Revisá tu cuenta.' },
+        { status: 409 },
+      );
+    }
+
     console.error('[sub] error creando la suscripción', mensaje, 'ip:', getClientIp(req));
 
     if (mensaje.includes('MP_ACCESS_TOKEN')) {

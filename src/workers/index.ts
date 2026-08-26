@@ -80,6 +80,54 @@ function normalize(network: string, payload: Record<string, unknown>) {
   };
 }
 
+// ─────────────────── Antifraude de conversiones ───────────────────
+
+/** Techo absoluto por conversión. Arriba de esto va a revisión humana. */
+const COMISION_MAXIMA_AUTOMATICA = Number(process.env.MAX_COMISION_AUTO ?? 500000);
+
+/**
+ * Verifica que la conversión reportada sea coherente con lo que la plataforma
+ * sabe del comercio y del clic. Devuelve el motivo del rechazo, o null si pasa.
+ */
+function validarConversion(
+  data: { orderAmount: number; commission: number; orderId: string },
+  click: { expiresAt: Date; merchant: { network: string | null; commissionRate: unknown; minOrderAmount: unknown } },
+  network: string,
+): string | null {
+  // El clic venció: la ventana de atribución del comercio ya pasó.
+  if (click.expiresAt < new Date()) return 'clic-vencido';
+
+  // La red que reporta tiene que ser la que gestiona ese comercio. Si no,
+  // cualquier red con secreto válido podría reclamar clics de comercios ajenos.
+  const redDelComercio = click.merchant.network;
+  if (redDelComercio && redDelComercio !== 'direct' && redDelComercio !== network) {
+    return 'red-no-coincide';
+  }
+
+  if (data.orderAmount < 0 || data.commission < 0) return 'montos-negativos';
+
+  const minimo = Number(click.merchant.minOrderAmount ?? 0);
+  if (data.orderAmount < minimo) return 'monto-bajo-el-minimo';
+
+  // Techo absoluto: una comisión gigante es un error de la red o un ataque.
+  if (data.commission > COMISION_MAXIMA_AUTOMATICA) return 'comision-sobre-el-techo';
+
+  // La comisión tiene que guardar relación con la tasa pactada. Se permite
+  // holgura porque las redes aplican bonus, promociones y comisiones por
+  // categoría, pero no un múltiplo arbitrario.
+  const tasa = Number(click.merchant.commissionRate ?? 0);
+  if (tasa > 0 && data.orderAmount > 0) {
+    const esperada = data.orderAmount * tasa;
+    const techo = Math.max(esperada * 3, esperada + 1000);
+    if (data.commission > techo) return 'comision-desproporcionada';
+  }
+
+  // Sin monto de orden no se puede validar nada: sólo se aceptan comisiones chicas.
+  if (data.orderAmount === 0 && data.commission > 5000) return 'comision-sin-orden';
+
+  return null;
+}
+
 // ─────────────────── Worker de webhooks ───────────────────
 
 const webhookWorker = new Worker<AffiliateWebhookJob>(
@@ -113,6 +161,21 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
       return { attributed: false };
     }
 
+    // ── Validación de la conversión reportada ──
+    //
+    // Sin estos controles, quien tenga el secreto de UNA red podía mandar
+    // {commission: 5000000} sobre su propio click y acuñar saldo retirable:
+    // el pool se inflaba, la válvula de solvencia dejaba de filtrar y la caja
+    // pagaba un premio en efectivo contra plata que nunca existió.
+    const problema = validarConversion(data, click, network);
+    if (problema) {
+      console.error(
+        `[webhooks] conversión rechazada (${problema}) — orden ${data.orderId}, red ${network}, ` +
+          `monto ${data.orderAmount}, comisión ${data.commission}. Queda para revisión manual.`,
+      );
+      return { attributed: false, reason: problema };
+    }
+
     const poolShare = Number(click.merchant.poolShareRate);
     const poolContribution = data.commission * poolShare;
 
@@ -129,11 +192,10 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
       ? await prisma.transaction.update({
           where: { id: existing.id },
           data: {
-            status: data.status,
+            // El status NO se toca acá: se persiste después de mover el dinero.
             commissionGross: data.commission,
             poolContribution,
             platformMargin: data.commission - poolContribution,
-            approvedAt: data.status === TransactionStatus.APPROVED ? new Date() : existing.approvedAt,
             rawPayload: payload as never,
           },
         })
@@ -156,7 +218,17 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
         });
 
     // 3. Mover el pool según el estado
-    const statusChanged = existing?.status !== data.status;
+    //
+    // El estado nuevo se persiste DESPUÉS de mover el dinero, no antes.
+    // Al revés, un fallo entre ambos pasos dejaba la transacción marcada como
+    // aprobada (o reembolsada) sin que el pool se hubiera movido, y el reintento
+    // de BullMQ veía `statusChanged === false` y salteaba el movimiento para
+    // siempre. La plata quedaba en el limbo sin forma de recuperarla.
+    //
+    // `estadoPrevio` viaja explícito a la revocación: releerlo de la base
+    // devolvería el estado nuevo y no diría de qué bucket sacar la comisión.
+    const estadoPrevio = existing?.status;
+    const statusChanged = estadoPrevio !== data.status;
 
     if (!existing) {
       await contributeToPool({
@@ -179,7 +251,28 @@ const webhookWorker = new Worker<AffiliateWebhookJob>(
         data.status === TransactionStatus.REJECTED ||
         data.status === TransactionStatus.CANCELLED)
     ) {
-      await revokeEscrowForTransaction(trx.id, `Estado ${data.status} reportado por ${network}`);
+      await revokeEscrowForTransaction(
+        trx.id,
+        `Estado ${data.status} reportado por ${network}`,
+        estadoPrevio,
+      );
+    }
+
+    // Recién ahora se persiste el estado nuevo: si algo de lo anterior falló,
+    // la transacción sigue en su estado viejo y el reintento vuelve a entrar
+    // por la misma rama.
+    if (statusChanged) {
+      await prisma.transaction.update({
+        where: { id: trx.id },
+        data: {
+          status: data.status,
+          approvedAt: data.status === TransactionStatus.APPROVED ? new Date() : trx.approvedAt,
+          rejectedAt:
+            data.status === TransactionStatus.REJECTED || data.status === TransactionStatus.REFUNDED
+              ? new Date()
+              : trx.rejectedAt,
+        },
+      });
     }
 
     // 4. Otorgar la caja (una sola vez, y solo si la orden no está caída)

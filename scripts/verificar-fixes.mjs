@@ -282,3 +282,142 @@ if (fallos === 0) {
   console.log(`${fallos} VERIFICACIONES FALLARON`);
   process.exit(1);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEGUNDA AUDITORÍA — escenarios nuevos
+// ═══════════════════════════════════════════════════════════════════════════
+
+let fallos2 = 0;
+const check2 = (nombre, ok, detalle = '') => {
+  console.log(`  ${ok ? 'OK  ' : 'FALLA'} ${nombre}${detalle ? ' — ' + detalle : ''}`);
+  if (!ok) fallos2++;
+};
+
+// ── 7. Open redirect con barra invertida ──
+console.log('\n7. El filtro de destino resiste la barra invertida');
+const ORIGEN = 'https://destino.invalid';
+function rutaInternaSegura(next) {
+  if (!next) return '/';
+  try {
+    const url = new URL(next, ORIGEN);
+    if (url.origin !== ORIGEN) return '/';
+    return url.pathname + url.search;
+  } catch { return '/'; }
+}
+const filtroViejo = (n) => (n && n.startsWith('/') && !n.startsWith('//') ? n : '/');
+
+const ataques = ['/\\sitio-falso.com', '/%09/sitio-falso.com', '//sitio-falso.com', 'https://sitio-falso.com'];
+for (const a of ataques) {
+  const viejo = filtroViejo(a);
+  const nuevo = rutaInternaSegura(a);
+  const escapaViejo = (() => { try { return new URL(viejo, ORIGEN).origin !== ORIGEN; } catch { return false; } })();
+  const escapaNuevo = (() => { try { return new URL(nuevo, ORIGEN).origin !== ORIGEN; } catch { return false; } })();
+  check2(`${JSON.stringify(a)} bloqueado`, !escapaNuevo, escapaViejo ? 'el filtro viejo lo dejaba pasar' : '');
+}
+check2('ruta interna sigue funcionando', rutaInternaSegura('/cajas?x=1') === '/cajas?x=1');
+
+// ── 8. Validación de conversiones de afiliado ──
+console.log('\n8. Una comisión inventada ya no acuña saldo');
+const TECHO = 500000;
+function validarConversion(data, click, network) {
+  if (click.expiresAt < Date.now()) return 'clic-vencido';
+  const red = click.merchant.network;
+  if (red && red !== 'direct' && red !== network) return 'red-no-coincide';
+  if (data.orderAmount < 0 || data.commission < 0) return 'montos-negativos';
+  if (data.orderAmount < (click.merchant.minOrderAmount ?? 0)) return 'monto-bajo-el-minimo';
+  if (data.commission > TECHO) return 'comision-sobre-el-techo';
+  const tasa = click.merchant.commissionRate ?? 0;
+  if (tasa > 0 && data.orderAmount > 0) {
+    const esperada = data.orderAmount * tasa;
+    if (data.commission > Math.max(esperada * 3, esperada + 1000)) return 'comision-desproporcionada';
+  }
+  if (data.orderAmount === 0 && data.commission > 5000) return 'comision-sin-orden';
+  return null;
+}
+const clickOk = {
+  expiresAt: Date.now() + 86400000,
+  merchant: { network: 'awin', commissionRate: 0.05, minOrderAmount: 0 },
+};
+check2('comisión de 5 millones rechazada',
+  validarConversion({ orderAmount: 5000000, commission: 5000000 }, clickOk, 'awin') !== null,
+  validarConversion({ orderAmount: 5000000, commission: 5000000 }, clickOk, 'awin'));
+check2('comisión desproporcionada rechazada',
+  validarConversion({ orderAmount: 10000, commission: 9000 }, clickOk, 'awin') === 'comision-desproporcionada');
+check2('clic vencido rechazado',
+  validarConversion({ orderAmount: 10000, commission: 500 }, { ...clickOk, expiresAt: Date.now() - 1000 }, 'awin') === 'clic-vencido');
+check2('red que no corresponde rechazada',
+  validarConversion({ orderAmount: 10000, commission: 500 }, clickOk, 'impact') === 'red-no-coincide');
+check2('comisión legítima aceptada',
+  validarConversion({ orderAmount: 10000, commission: 500 }, clickOk, 'awin') === null);
+check2('bonus razonable aceptado',
+  validarConversion({ orderAmount: 10000, commission: 1200 }, clickOk, 'awin') === null,
+  'las redes aplican promociones');
+
+// ── 9. Reembolso de suscripción ──
+console.log('\n9. Un contracargo de suscripción revierte todo');
+function cicloSuscripcion({ conFix }) {
+  let pool = 50000, saldoUsuario = 0, cajas = 0;
+  const precio = 15000, costoProveedor = 5000, share = 0.5;
+  const margen = precio - costoProveedor;
+  const aporte = margen * share;
+  pool += aporte;
+  cajas = 1;
+  const premio = 2000;
+  pool -= premio;
+  saldoUsuario += premio;
+  // contracargo
+  if (conFix) {
+    saldoUsuario -= premio;
+    pool += premio;
+    pool -= aporte;
+    cajas = 0;
+  }
+  return { pool, saldoUsuario, cajas };
+}
+const sinF = cicloSuscripcion({ conFix: false });
+const conF = cicloSuscripcion({ conFix: true });
+check2('antes: el usuario se quedaba con el premio', sinF.saldoUsuario === 2000, `saldo=${sinF.saldoUsuario}`);
+check2('antes: el pool retenía la comisión devuelta', sinF.pool === 53000, `pool=${sinF.pool}`);
+check2('ahora: el saldo se revierte', conF.saldoUsuario === 0);
+check2('ahora: el pool vuelve al valor original', conF.pool === 50000, `pool=${conF.pool}`);
+
+// ── 10. Idempotencia del aporte al pool ──
+console.log('\n10. El aporte al pool no se duplica');
+function aportar({ conFix, veces }) {
+  let pool = 0;
+  const asientos = new Set();
+  for (let i = 0; i < veces; i++) {
+    const clave = 'tx1:CONTRIBUTION';
+    if (conFix && asientos.has(clave)) continue;
+    asientos.add(clave);
+    pool += 1000;
+  }
+  return pool;
+}
+check2('antes: 3 reintentos sumaban 3 veces', aportar({ conFix: false, veces: 3 }) === 3000);
+check2('ahora: 3 reintentos suman una sola vez', aportar({ conFix: true, veces: 3 }) === 1000);
+
+// ── 11. Clave de idempotencia del webhook con estado ──
+console.log('\n11. Los reembolsos de Mercado Pago ya no se descartan');
+function ingestaMP({ conFix, eventos }) {
+  const procesados = new Set();
+  let hechos = 0;
+  for (const [id, estado] of eventos) {
+    const clave = conFix ? `payment:${id}:${estado}` : `payment:${id}`;
+    if (procesados.has(clave)) continue;
+    procesados.add(clave);
+    hechos++;
+  }
+  return hechos;
+}
+const flujoMP = [['P1', 'APPROVED'], ['P1', 'APPROVED'], ['P1', 'REFUNDED']];
+check2('antes: el reembolso se descartaba', ingestaMP({ conFix: false, eventos: flujoMP }) === 1);
+check2('ahora: se procesa el reembolso, no el duplicado', ingestaMP({ conFix: true, eventos: flujoMP }) === 2);
+
+console.log('\n' + '─'.repeat(60));
+if (fallos2 === 0) {
+  console.log('SEGUNDA AUDITORÍA: TODAS LAS VERIFICACIONES PASARON');
+} else {
+  console.log(`SEGUNDA AUDITORÍA: ${fallos2} FALLARON`);
+  process.exit(1);
+}

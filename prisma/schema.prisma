@@ -413,6 +413,7 @@ model Transaction {
   @@index([status, escrowReleaseAt])
   @@index([merchantId, status])
   @@index([type, status, createdAt])
+  @@index([createdAt])
   @@map("transactions")
 }
 
@@ -625,6 +626,10 @@ model Subscription {
   plan    SubscriptionPlan     @relation(fields: [planId], references: [id])
   charges SubscriptionCharge[]
 
+  /// Un usuario no puede tener dos suscripciones al mismo plan. Sin esto, dos
+  /// clics concurrentes creaban dos preapprovals en Mercado Pago y al cliente
+  /// le debitaban dos veces por mes.
+  @@unique([userId, planId])
   @@index([userId, status])
   @@index([status, nextChargeAt])
   @@map("subscriptions")
@@ -653,6 +658,7 @@ model SubscriptionCharge {
 
   @@index([subscriptionId, chargedAt])
   @@index([status])
+  @@index([status, chargedAt])
   @@map("subscription_charges")
 }
 
@@ -830,6 +836,9 @@ model BoxOpening {
 
   @@index([userId, createdAt])
   @@index([prizeId, createdAt])
+  /// El panel cuenta aperturas por rango de fecha en cada carga; sin este
+  /// índice hace un recorrido completo de la tabla que más crece.
+  @@index([createdAt])
   @@map("box_openings")
 }
 
@@ -861,6 +870,7 @@ model UserReward {
 
   @@index([userId, status])
   @@index([status, expiresAt])
+  @@index([userId, createdAt])
   @@map("user_rewards")
 }
 
@@ -889,6 +899,10 @@ model PrizePoolLedger {
   transaction Transaction? @relation(fields: [transactionId], references: [id])
   user        User?        @relation("LedgerUser", fields: [userId], references: [id])
 
+  /// Un aporte por transacción y tipo. Sin esto, un reintento del worker o
+  /// una secuencia pending→approved→refunded→approved sumaba la comisión al
+  /// pool más de una vez, inflando el saldo con plata inexistente.
+  @@unique([transactionId, type])
   @@index([type, createdAt])
   @@index([transactionId])
   @@index([createdAt])

@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
+import { timingSafeEqual } from 'crypto';
 import { runSeed } from '@/lib/seedData';
 import { prisma } from '@/lib/prisma';
 import { UserRole } from '@/generated/prisma/client';
+import { rateLimit, getClientIp } from '@/lib/rateLimit';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -29,8 +31,27 @@ export async function GET(req: Request) {
     );
   }
 
+  // Sin límite, el secreto es adivinable por fuerza bruta y este endpoint
+  // promueve a administrador: quien lo acierte controla los premios.
+  const limite = await rateLimit(`setup:${getClientIp(req)}`, 5, 3600);
+  if (!limite.ok) {
+    return NextResponse.json(
+      { error: 'Demasiados intentos. Probá de nuevo más tarde.' },
+      { status: 429 },
+    );
+  }
+
   const url = new URL(req.url);
-  if (url.searchParams.get('secret') !== secret) {
+  const provisto = url.searchParams.get('secret') ?? '';
+
+  // Comparación de tiempo constante: comparar con !== filtra información sobre
+  // el secreto a través de cuánto tarda en fallar.
+  const a = Buffer.from(provisto);
+  const b = Buffer.from(secret);
+  const coincide = a.length === b.length && timingSafeEqual(a, b);
+
+  if (!coincide) {
+    console.warn(`[setup] intento con secreto incorrecto desde ${getClientIp(req)}`);
     return NextResponse.json({ error: 'Secreto incorrecto' }, { status: 401 });
   }
 
@@ -43,6 +64,18 @@ export async function GET(req: Request) {
       const user = await prisma.user.findUnique({ where: { email: adminEmail } });
       if (user) {
         await prisma.user.update({ where: { id: user.id }, data: { role: UserRole.ADMIN } });
+        // Toda promoción a administrador deja rastro: es la acción más
+        // privilegiada del sistema y era la única que no se auditaba.
+        await prisma.adminAuditLog.create({
+          data: {
+            actorUserId: user.id,
+            action: 'setup.promote_admin',
+            entityType: 'User',
+            entityId: user.id,
+            after: { email: adminEmail, role: 'ADMIN' },
+            ip: getClientIp(req),
+          },
+        });
         log.push(`${adminEmail} ahora es ADMIN`);
       } else {
         log.push(`No encontré el usuario ${adminEmail} — entrá una vez con Google y volvé a llamar esta URL`);

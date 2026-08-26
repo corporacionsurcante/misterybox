@@ -56,9 +56,9 @@ export default async function CajasPage() {
                   TIER_COLOR[b.tier] ?? TIER_COLOR.BRONZE
                 }`}
               >
-                <Gift className="mb-4 h-10 w-10 text-white/90 transition group-hover:scale-110" />
-                <h3 className="font-bold text-white">{b.boxCatalog.name}</h3>
-                <p className="mt-1 flex items-center gap-1.5 text-xs text-white/70">
+                <Gift className="mb-4 h-10 w-10 text-slate-900/80 transition group-hover:scale-110" />
+                <h3 className="font-bold text-slate-900">{b.boxCatalog.name}</h3>
+                <p className="mt-1 flex items-center gap-1.5 text-xs text-slate-900/70">
                   <Clock className="h-3 w-3" />
                   Vence {b.expiresAt.toLocaleDateString('es-AR')}
                 </p>

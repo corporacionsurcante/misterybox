@@ -18,7 +18,7 @@
 
 import { Prisma, SubscriptionStatus, ChargeStatus, TransactionStatus, TransactionType } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
-import { contributeToPool } from '@/services/mysteryBoxService';
+import { contributeToPool, revokeEscrowForTransaction } from '@/services/mysteryBoxService';
 
 const d = (v: Prisma.Decimal | number | string): number => Number(v);
 const money = (n: number): Prisma.Decimal => new Prisma.Decimal(n.toFixed(2));
@@ -28,6 +28,71 @@ export interface ResultadoCobro {
   motivo?: string;
   cajasOtorgadas?: number;
   transactionId?: string;
+}
+
+/** Calcula cuándo toca el próximo débito, para mostrárselo al suscriptor. */
+function proximoCobro(frecuencia: number, tipo: string): Date {
+  const ahora = new Date();
+  if (tipo === 'days') {
+    ahora.setDate(ahora.getDate() + frecuencia);
+  } else {
+    ahora.setMonth(ahora.getMonth() + frecuencia);
+  }
+  return ahora;
+}
+
+/**
+ * Revierte un cobro que ya se había acreditado: devolución o contracargo.
+ *
+ * Reutiliza `revokeEscrowForTransaction`, que ya sabe revocar las cajas sin
+ * abrir, anular los premios que el usuario todavía no canjeó, devolver el
+ * stock y sacar la comisión del pool.
+ */
+async function revertirCobro(
+  cobro: { id: string; transactionId: string | null; mpPaymentId: string },
+  suscripcion: { id: string; status: SubscriptionStatus },
+  estado: ChargeStatus,
+): Promise<ResultadoCobro> {
+  const motivo =
+    estado === ChargeStatus.REFUNDED
+      ? 'Cobro devuelto o contracargado por el banco'
+      : 'Cobro rechazado después de haberse acreditado';
+
+  if (cobro.transactionId) {
+    await revokeEscrowForTransaction(
+      cobro.transactionId,
+      motivo,
+      // La transacción de una suscripción nace APROBADA: la comisión ya está
+      // en el saldo gastable del pool, no en las reservas.
+      TransactionStatus.APPROVED,
+    );
+
+    await prisma.transaction.update({
+      where: { id: cobro.transactionId },
+      data: { status: TransactionStatus.REFUNDED, rejectedAt: new Date() },
+    });
+  }
+
+  await prisma.subscriptionCharge.update({
+    where: { id: cobro.id },
+    data: { status: estado, boxesGranted: 0 },
+  });
+
+  // Un contracargo es señal de disputa: se pausa la suscripción en vez de
+  // seguir debitando y acumulando reclamos. La reactivación es manual.
+  if (estado === ChargeStatus.REFUNDED && suscripcion.status === SubscriptionStatus.ACTIVE) {
+    await prisma.subscription.update({
+      where: { id: suscripcion.id },
+      data: { status: SubscriptionStatus.PAUSED },
+    });
+  }
+
+  console.warn(
+    `[sub] cobro ${cobro.mpPaymentId} revertido (${estado}). ` +
+      'Cajas y saldo revocados, comisión devuelta al pool.',
+  );
+
+  return { procesado: true, motivo: `cobro-revertido-${estado.toLowerCase()}`, cajasOtorgadas: 0 };
 }
 
 /**
@@ -67,7 +132,17 @@ export async function procesarCobroDeSuscripcion(params: {
   });
 
   if (cobroPrevio) {
-    // Si antes estaba pendiente y ahora se aprobó, seguimos; si no, cortamos.
+    // Un cobro aprobado que después se devuelve o se contracarga: hay que
+    // revocar las cajas y el saldo, y sacar la comisión del pool. Sin esto, el
+    // cliente hacía el contracargo, se quedaba con el premio, y el pool seguía
+    // repartiendo una comisión que el banco ya había recuperado.
+    if (
+      cobroPrevio.status === ChargeStatus.APPROVED &&
+      (estado === ChargeStatus.REFUNDED || estado === ChargeStatus.REJECTED)
+    ) {
+      return revertirCobro(cobroPrevio, suscripcion, estado);
+    }
+
     if (cobroPrevio.status === ChargeStatus.APPROVED || estado !== ChargeStatus.APPROVED) {
       return {
         procesado: false,
@@ -173,12 +248,24 @@ export async function procesarCobroDeSuscripcion(params: {
       data: { boxGranted: true },
     });
 
+    // Sólo se reactiva si la suscripción seguía viva. Un cobro demorado que
+    // llega después de una baja no puede resucitarla: dejaba una suscripción
+    // ACTIVE con fecha de cancelación puesta, y la contaba como ingreso
+    // recurrente de alguien que ya se había ido.
+    const estadosVivos: SubscriptionStatus[] = [
+      SubscriptionStatus.PENDING,
+      SubscriptionStatus.ACTIVE,
+      SubscriptionStatus.PAUSED,
+    ];
+    const puedeActivarse = estadosVivos.includes(suscripcion.status);
+
     await tx.subscription.update({
       where: { id: suscripcion.id },
       data: {
-        status: SubscriptionStatus.ACTIVE,
+        ...(puedeActivarse ? { status: SubscriptionStatus.ACTIVE, cancelledAt: null } : {}),
         cyclesCharged: { increment: 1 },
         startedAt: suscripcion.startedAt ?? new Date(),
+        nextChargeAt: proximoCobro(plan.frequency, plan.frequencyType),
       },
     });
 
@@ -188,12 +275,27 @@ export async function procesarCobroDeSuscripcion(params: {
   // El pool se mueve fuera de la transacción anterior porque toma su propio
   // lock sobre pool_state. Anidarlos invertiría el orden de candados respecto
   // del unboxing y podría trabar las dos operaciones entre sí.
-  await contributeToPool({
-    transactionId: resultado.transactionId,
-    amount: aporteAlPool,
-    status: TransactionStatus.APPROVED,
-    userId: suscripcion.userId,
-  });
+  //
+  // El precio de esa decisión es esta ventana: las cajas ya existen y el pool
+  // todavía no recibió el aporte. Si falla, se propaga el error para que el
+  // webhook devuelva 500 y Mercado Pago reintente; `contributeToPool` es
+  // idempotente, así que el reintento no duplica el aporte. Y como el evento
+  // no quedó marcado como procesado, el reintento sí vuelve a entrar.
+  try {
+    await contributeToPool({
+      transactionId: resultado.transactionId,
+      amount: aporteAlPool,
+      status: TransactionStatus.APPROVED,
+      userId: suscripcion.userId,
+    });
+  } catch (err) {
+    console.error(
+      `[sub] el aporte al pool falló para la tx ${resultado.transactionId} ` +
+        `(${aporteAlPool.toFixed(2)}). Las cajas ya existen sin respaldo. Se pide reintento.`,
+      err,
+    );
+    throw err;
+  }
 
   return {
     procesado: true,

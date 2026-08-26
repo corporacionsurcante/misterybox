@@ -23,7 +23,7 @@ export default async function HomePage() {
           Cada compra tiene premio
         </div>
 
-        <h1 className="mb-5 text-balance text-5xl font-bold leading-tight sm:text-6xl">
+        <h1 className="mb-5 text-balance text-4xl font-bold leading-tight sm:text-5xl md:text-6xl">
           Comprá donde ya comprás.
           <br />
           <span className="bg-gradient-to-r from-amber-300 to-fuchsia-400 bg-clip-text text-transparent">
@@ -39,7 +39,7 @@ export default async function HomePage() {
         <div className="flex flex-wrap items-center justify-center gap-3">
           <Link
             href="/tiendas"
-            className="rounded-full bg-gradient-to-r from-amber-500 to-amber-600 px-8 py-4 font-bold text-white shadow-[0_0_40px_-8px_rgba(245,158,11,0.7)] transition hover:brightness-110"
+            className="rounded-full bg-gradient-to-r from-amber-500 to-amber-600 px-8 py-4 font-bold text-slate-900 shadow-[0_0_40px_-8px_rgba(245,158,11,0.7)] transition hover:brightness-110"
           >
             Ver tiendas
           </Link>

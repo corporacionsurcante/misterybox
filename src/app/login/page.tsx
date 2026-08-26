@@ -4,6 +4,20 @@ import { auth, signIn } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
+const ORIGEN_CENTINELA = 'https://destino.invalid';
+
+function rutaInternaSegura(next: string | undefined): string {
+  if (!next) return '/';
+  try {
+    const url = new URL(next, ORIGEN_CENTINELA);
+    // Si al resolver cambió de origen, el destino apuntaba afuera.
+    if (url.origin !== ORIGEN_CENTINELA) return '/';
+    return url.pathname + url.search;
+  } catch {
+    return '/';
+  }
+}
+
 export default async function LoginPage({
   searchParams,
 }: {
@@ -11,12 +25,14 @@ export default async function LoginPage({
 }) {
   const { next } = await searchParams;
 
-  // Sólo rutas internas. Sin este filtro, un link como
-  // /login?next=https://sitio-falso.com sacaba al usuario del dominio real
-  // desde una URL legítima — la base de un phishing convincente.
-  // El doble slash inicial también hay que bloquearlo: //evil.com es una URL
-  // protocol-relative y el navegador la trata como externa.
-  const destino = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+  // Sólo rutas internas.
+  //
+  // El filtro ingenuo (empieza con "/" y no con "//") se evade con una barra
+  // invertida: el navegador normaliza "/\\sitio-falso.com" a
+  // "https://sitio-falso.com". Por eso se resuelve la URL contra un origen
+  // centinela y se acepta sólo si el resultado se quedó en ese origen — el
+  // mismo algoritmo que aplica el navegador, sin adivinar casos borde.
+  const destino = rutaInternaSegura(next);
 
   const session = await auth();
   if (session?.user) redirect(destino);
